@@ -1,0 +1,4 @@
+ALTER TABLE productos
+ADD COLUMN IF NOT EXISTS puntos_por_unidad NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE inventario
+DROP COLUMN IF EXISTS puntos_por_unidad;
