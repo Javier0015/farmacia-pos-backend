@@ -4,12 +4,6 @@ import pool from './config/db.js';
 
 dotenv.config();
 
-import dotenv from 'dotenv';
-import app from './app.js';
-import pool from './config/db.js';
-
-dotenv.config();
-
 const PORT = process.env.PORT || 3001;
 
 const iniciarServidor = async () => {
