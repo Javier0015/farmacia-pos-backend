@@ -45,60 +45,112 @@ export const listarInventarioPorSucursal = async (req, res) => {
     }
 
     let query = `
-  SELECT
-    i.id_inventario,
-    i.id_sucursal,
-    s.nombre AS sucursal,
-    i.id_producto,
-    p.codigo_barras,
-    p.nombre AS producto,
-    p.descripcion,
-    c.nombre AS categoria,
-    p.laboratorio,
-    p.presentacion,
-    p.precio_compra,
-    p.precio_venta,
-    p.puntos_por_unidad,
-    i.stock_actual,
-    i.stock_minimo,
-    i.ubicacion,
-    CASE 
-      WHEN i.stock_actual <= i.stock_minimo THEN true
-      ELSE false
-    END AS bajo_stock,
-    i.fecha_actualizacion,
-    COALESCE(lotes.total_lotes, 0) AS total_lotes,
-    lotes.proxima_caducidad,
-    CASE
-      WHEN lotes.proxima_caducidad IS NULL THEN false
-      WHEN lotes.proxima_caducidad <= CURRENT_DATE + INTERVAL '90 days' THEN true
-      ELSE false
-    END AS caducidad_proxima
-  FROM inventario_sucursal i
-  INNER JOIN sucursales s ON s.id_sucursal = i.id_sucursal
-  INNER JOIN productos p ON p.id_producto = i.id_producto
-  LEFT JOIN categorias c ON c.id_categoria = p.id_categoria
-  LEFT JOIN (
-    SELECT 
-      id_sucursal,
-      id_producto,
-      COUNT(*) AS total_lotes,
-      MIN(fecha_caducidad) FILTER (
-        WHERE stock_actual > 0 
-        AND activo = true 
-        AND fecha_caducidad IS NOT NULL
-      ) AS proxima_caducidad
-    FROM inventario_lotes
-    GROUP BY id_sucursal, id_producto
-  ) lotes ON lotes.id_sucursal = i.id_sucursal
-         AND lotes.id_producto = i.id_producto
-  WHERE i.id_sucursal = $1
-`;
+      SELECT
+        i.id_inventario,
+        i.id_sucursal,
+        s.nombre AS sucursal,
+        i.id_producto,
+        p.codigo_barras,
+        p.nombre AS producto,
+        p.descripcion,
+        c.nombre AS categoria,
+        p.laboratorio,
+        p.presentacion,
+        p.es_controlado AS controlado,
+        p.requiere_receta,
+        p.precio_compra,
+        p.precio_venta,
+        p.puntos_por_unidad,
+        i.stock_actual,
+        i.stock_minimo,
+        i.ubicacion,
+
+        CASE 
+          WHEN i.stock_actual <= i.stock_minimo THEN true
+          ELSE false
+        END AS bajo_stock,
+
+        /*
+          OFERTAS POR CATEGORÍA
+          Si existe una oferta activa para la categoría del producto
+          y la fecha actual está dentro del rango, se calcula el precio final.
+        */
+        oc.id_oferta,
+        oc.nombre AS oferta_nombre,
+        oc.porcentaje_descuento,
+
+        CASE
+          WHEN oc.id_oferta IS NOT NULL THEN true
+          ELSE false
+        END AS tiene_oferta,
+
+        CASE
+          WHEN oc.id_oferta IS NOT NULL THEN
+            ROUND(
+              p.precio_venta - (p.precio_venta * oc.porcentaje_descuento / 100),
+              2
+            )
+          ELSE
+            p.precio_venta
+        END AS precio_con_descuento,
+
+        CASE
+          WHEN oc.id_oferta IS NOT NULL THEN
+            ROUND(
+              p.precio_venta * oc.porcentaje_descuento / 100,
+              2
+            )
+          ELSE
+            0
+        END AS descuento_unitario,
+
+        i.fecha_actualizacion,
+        COALESCE(lotes.total_lotes, 0) AS total_lotes,
+        lotes.proxima_caducidad,
+
+        CASE
+          WHEN lotes.proxima_caducidad IS NULL THEN false
+          WHEN lotes.proxima_caducidad <= CURRENT_DATE + INTERVAL '90 days' THEN true
+          ELSE false
+        END AS caducidad_proxima
+
+      FROM inventario_sucursal i
+      INNER JOIN sucursales s 
+        ON s.id_sucursal = i.id_sucursal
+      INNER JOIN productos p 
+        ON p.id_producto = i.id_producto
+      LEFT JOIN categorias c 
+        ON c.id_categoria = p.id_categoria
+
+      LEFT JOIN ofertas_categorias oc
+        ON oc.id_categoria = p.id_categoria
+       AND oc.activo = true
+       AND CURRENT_DATE BETWEEN oc.fecha_inicio AND oc.fecha_fin
+
+      LEFT JOIN (
+        SELECT 
+          id_sucursal,
+          id_producto,
+          COUNT(*) AS total_lotes,
+          MIN(fecha_caducidad) FILTER (
+            WHERE stock_actual > 0 
+              AND activo = true 
+              AND fecha_caducidad IS NOT NULL
+          ) AS proxima_caducidad
+        FROM inventario_lotes
+        GROUP BY id_sucursal, id_producto
+      ) lotes 
+        ON lotes.id_sucursal = i.id_sucursal
+       AND lotes.id_producto = i.id_producto
+
+      WHERE i.id_sucursal = $1
+    `;
 
     const params = [sucursal];
 
-    if (buscar) {
+    if (buscar && buscar.trim()) {
       params.push(`%${buscar.trim()}%`);
+
       query += `
         AND (
           p.nombre ILIKE $${params.length}
@@ -109,7 +161,9 @@ export const listarInventarioPorSucursal = async (req, res) => {
       `;
     }
 
-    query += ` ORDER BY p.nombre ASC `;
+    query += `
+      ORDER BY p.nombre ASC
+    `;
 
     const resultado = await pool.query(query, params);
 
@@ -1038,5 +1092,109 @@ export const bajaLotePorCaducidad = async (req, res) => {
     });
   } finally {
     client.release();
+  }
+};
+
+export const consultarStockSucursales = async (req, res) => {
+  try {
+    const { buscar } = req.query;
+
+    if (!buscar || !buscar.trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Debes escribir el nombre, código de barras o presentación del producto',
+      });
+    }
+
+    const textoBusqueda = buscar.trim();
+    const texto = `%${textoBusqueda}%`;
+
+    const productoResultado = await pool.query(
+      `
+      SELECT
+        p.id_producto,
+        p.codigo_barras,
+        p.nombre,
+        p.descripcion,
+        p.laboratorio,
+        p.presentacion,
+        c.nombre AS categoria,
+        p.precio_venta
+      FROM productos p
+      LEFT JOIN categorias c ON c.id_categoria = p.id_categoria
+      WHERE 
+        p.nombre ILIKE $1
+        OR p.codigo_barras ILIKE $1
+        OR p.laboratorio ILIKE $1
+        OR p.presentacion ILIKE $1
+      ORDER BY 
+        CASE 
+          WHEN p.codigo_barras = $2 THEN 1
+          WHEN p.nombre ILIKE $1 THEN 2
+          ELSE 3
+        END,
+        p.nombre ASC
+      LIMIT 1
+      `,
+      [texto, textoBusqueda]
+    );
+
+    if (productoResultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró ningún producto con esa búsqueda',
+      });
+    }
+
+    const producto = productoResultado.rows[0];
+
+    const sucursalesResultado = await pool.query(
+      `
+      SELECT
+        s.id_sucursal,
+        s.nombre AS sucursal,
+        s.direccion,
+        COALESCE(i.stock_actual, 0) AS stock,
+        COALESCE(i.stock_minimo, 0) AS stock_minimo,
+        i.ubicacion,
+        i.fecha_actualizacion,
+        CASE
+          WHEN COALESCE(i.stock_actual, 0) <= 0 THEN 'SIN_STOCK'
+          WHEN COALESCE(i.stock_actual, 0) <= COALESCE(i.stock_minimo, 0) THEN 'STOCK_BAJO'
+          ELSE 'DISPONIBLE'
+        END AS estado
+      FROM sucursales s
+      LEFT JOIN inventario_sucursal i 
+        ON i.id_sucursal = s.id_sucursal
+       AND i.id_producto = $1
+      WHERE s.activo = true
+      ORDER BY 
+        COALESCE(i.stock_actual, 0) DESC,
+        s.nombre ASC
+      `,
+      [producto.id_producto]
+    );
+
+    return res.json({
+      ok: true,
+      producto: {
+        id_producto: producto.id_producto,
+        nombre: producto.nombre,
+        descripcion: producto.descripcion,
+        codigo_barras: producto.codigo_barras,
+        laboratorio: producto.laboratorio,
+        presentacion: producto.presentacion,
+        categoria: producto.categoria,
+        precio_venta: producto.precio_venta,
+      },
+      sucursales: sucursalesResultado.rows,
+    });
+  } catch (error) {
+    console.error('Error al consultar stock en sucursales:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al consultar stock en sucursales',
+    });
   }
 };

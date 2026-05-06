@@ -1,6 +1,54 @@
 import bcrypt from 'bcryptjs';
 import { pool } from '../config/db.js';
 
+const esRolDoctor = (rol) => {
+  return String(rol || '').toUpperCase() === 'DOCTOR';
+};
+
+const asegurarPerfilDoctor = async ({
+  client,
+  id_usuario,
+  nombre,
+  correo,
+  activo = true,
+}) => {
+  await client.query(
+    `
+    INSERT INTO doctores_perfiles (
+      id_usuario,
+      nombre_completo,
+      correo,
+      perfil_completo,
+      activo
+    )
+    VALUES ($1, $2, $3, false, $4)
+    ON CONFLICT (id_usuario)
+    DO UPDATE SET
+      activo = EXCLUDED.activo,
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    `,
+    [
+      id_usuario,
+      nombre || null,
+      correo || null,
+      activo,
+    ]
+  );
+};
+
+const desactivarPerfilDoctor = async ({ client, id_usuario }) => {
+  await client.query(
+    `
+    UPDATE doctores_perfiles
+    SET
+      activo = false,
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE id_usuario = $1
+    `,
+    [id_usuario]
+  );
+};
+
 export const listarRoles = async (req, res) => {
   try {
     const resultado = await pool.query(
@@ -46,6 +94,13 @@ export const listarUsuarios = async (req, res) => {
         u.activo,
         u.fecha_creacion,
         u.fecha_actualizacion,
+
+        dp.id_doctor,
+        dp.nombre_completo AS doctor_nombre_completo,
+        dp.cedula_profesional AS doctor_cedula_profesional,
+        dp.especialidad AS doctor_especialidad,
+        dp.perfil_completo AS doctor_perfil_completo,
+
         COALESCE(
           json_agg(
             json_build_object(
@@ -58,6 +113,8 @@ export const listarUsuarios = async (req, res) => {
         ) AS sucursales
       FROM usuarios u
       INNER JOIN roles r ON r.id_rol = u.id_rol
+      LEFT JOIN doctores_perfiles dp
+        ON dp.id_usuario = u.id_usuario
       LEFT JOIN usuario_sucursales us 
         ON us.id_usuario = u.id_usuario
         AND us.activo = true
@@ -76,6 +133,8 @@ export const listarUsuarios = async (req, res) => {
           OR u.usuario ILIKE $${params.length}
           OR u.correo ILIKE $${params.length}
           OR r.nombre ILIKE $${params.length}
+          OR dp.nombre_completo ILIKE $${params.length}
+          OR dp.cedula_profesional ILIKE $${params.length}
         )
       `;
     }
@@ -94,7 +153,12 @@ export const listarUsuarios = async (req, res) => {
         r.nombre,
         u.activo,
         u.fecha_creacion,
-        u.fecha_actualizacion
+        u.fecha_actualizacion,
+        dp.id_doctor,
+        dp.nombre_completo,
+        dp.cedula_profesional,
+        dp.especialidad,
+        dp.perfil_completo
       ORDER BY u.nombre ASC
     `;
 
@@ -155,14 +219,44 @@ export const crearUsuario = async (req, res) => {
       });
     }
 
-    if (!Array.isArray(sucursales) || sucursales.length === 0) {
+    await client.query('BEGIN');
+
+    const rolExiste = await client.query(
+      `
+      SELECT
+        id_rol,
+        nombre
+      FROM roles
+      WHERE id_rol = $1
+        AND activo = true
+      `,
+      [id_rol]
+    );
+
+    if (rolExiste.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Rol no encontrado o inactivo',
+      });
+    }
+
+    const rolSeleccionado = rolExiste.rows[0].nombre;
+    const usuarioEsDoctor = esRolDoctor(rolSeleccionado);
+
+    const sucursalesNormalizadas = Array.isArray(sucursales)
+      ? sucursales.filter((idSucursal) => idSucursal !== null && idSucursal !== undefined && idSucursal !== '')
+      : [];
+
+    if (!usuarioEsDoctor && sucursalesNormalizadas.length === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'Debes asignar al menos una sucursal',
       });
     }
-
-    await client.query('BEGIN');
 
     const existeUsuario = await client.query(
       `
@@ -202,25 +296,6 @@ export const crearUsuario = async (req, res) => {
       }
     }
 
-    const rolExiste = await client.query(
-      `
-      SELECT id_rol
-      FROM roles
-      WHERE id_rol = $1
-      AND activo = true
-      `,
-      [id_rol]
-    );
-
-    if (rolExiste.rows.length === 0) {
-      await client.query('ROLLBACK');
-
-      return res.status(404).json({
-        ok: false,
-        mensaje: 'Rol no encontrado o inactivo',
-      });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
 
     const usuarioCreado = await client.query(
@@ -254,7 +329,7 @@ export const crearUsuario = async (req, res) => {
 
     const idUsuarioNuevo = usuarioCreado.rows[0].id_usuario;
 
-    for (const idSucursal of sucursales) {
+    for (const idSucursal of sucursalesNormalizadas) {
       await client.query(
         `
         INSERT INTO usuario_sucursales (
@@ -270,12 +345,28 @@ export const crearUsuario = async (req, res) => {
       );
     }
 
+    if (usuarioEsDoctor) {
+      await asegurarPerfilDoctor({
+        client,
+        id_usuario: idUsuarioNuevo,
+        nombre: nombre.trim(),
+        correo: correo ? correo.trim() : null,
+        activo: true,
+      });
+    }
+
     await client.query('COMMIT');
 
     return res.status(201).json({
       ok: true,
-      mensaje: 'Usuario creado correctamente',
-      usuario: usuarioCreado.rows[0],
+      mensaje: usuarioEsDoctor
+        ? 'Cuenta de doctor creada correctamente'
+        : 'Usuario creado correctamente',
+      usuario: {
+        ...usuarioCreado.rows[0],
+        rol: rolSeleccionado,
+        requiere_completar_perfil_doctor: usuarioEsDoctor,
+      },
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -328,21 +419,51 @@ export const actualizarUsuario = async (req, res) => {
       });
     }
 
-    if (!Array.isArray(sucursales) || sucursales.length === 0) {
+    await client.query('BEGIN');
+
+    const rolExiste = await client.query(
+      `
+      SELECT
+        id_rol,
+        nombre
+      FROM roles
+      WHERE id_rol = $1
+        AND activo = true
+      `,
+      [id_rol]
+    );
+
+    if (rolExiste.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Rol no encontrado o inactivo',
+      });
+    }
+
+    const rolSeleccionado = rolExiste.rows[0].nombre;
+    const usuarioEsDoctor = esRolDoctor(rolSeleccionado);
+
+    const sucursalesNormalizadas = Array.isArray(sucursales)
+      ? sucursales.filter((idSucursal) => idSucursal !== null && idSucursal !== undefined && idSucursal !== '')
+      : [];
+
+    if (!usuarioEsDoctor && sucursalesNormalizadas.length === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'Debes asignar al menos una sucursal',
       });
     }
 
-    await client.query('BEGIN');
-
     const existeUsuario = await client.query(
       `
       SELECT id_usuario
       FROM usuarios
       WHERE LOWER(usuario) = LOWER($1)
-      AND id_usuario <> $2
+        AND id_usuario <> $2
       `,
       [usuario.trim(), id]
     );
@@ -362,7 +483,7 @@ export const actualizarUsuario = async (req, res) => {
         SELECT id_usuario
         FROM usuarios
         WHERE LOWER(correo) = LOWER($1)
-        AND id_usuario <> $2
+          AND id_usuario <> $2
         `,
         [correo.trim(), id]
       );
@@ -446,7 +567,7 @@ export const actualizarUsuario = async (req, res) => {
       [id]
     );
 
-    for (const idSucursal of sucursales) {
+    for (const idSucursal of sucursalesNormalizadas) {
       await client.query(
         `
         INSERT INTO usuario_sucursales (
@@ -462,12 +583,33 @@ export const actualizarUsuario = async (req, res) => {
       );
     }
 
+    if (usuarioEsDoctor) {
+      await asegurarPerfilDoctor({
+        client,
+        id_usuario: id,
+        nombre: nombre.trim(),
+        correo: correo ? correo.trim() : null,
+        activo: activo !== false,
+      });
+    } else {
+      await desactivarPerfilDoctor({
+        client,
+        id_usuario: id,
+      });
+    }
+
     await client.query('COMMIT');
 
     return res.json({
       ok: true,
-      mensaje: 'Usuario actualizado correctamente',
-      usuario: usuarioActualizado.rows[0],
+      mensaje: usuarioEsDoctor
+        ? 'Cuenta de doctor actualizada correctamente'
+        : 'Usuario actualizado correctamente',
+      usuario: {
+        ...usuarioActualizado.rows[0],
+        rol: rolSeleccionado,
+        requiere_completar_perfil_doctor: usuarioEsDoctor,
+      },
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -484,6 +626,8 @@ export const actualizarUsuario = async (req, res) => {
 };
 
 export const desactivarUsuario = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { id } = req.params;
 
@@ -494,7 +638,9 @@ export const desactivarUsuario = async (req, res) => {
       });
     }
 
-    const resultado = await pool.query(
+    await client.query('BEGIN');
+
+    const resultado = await client.query(
       `
       UPDATE usuarios
       SET
@@ -507,11 +653,20 @@ export const desactivarUsuario = async (req, res) => {
     );
 
     if (resultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'Usuario no encontrado',
       });
     }
+
+    await desactivarPerfilDoctor({
+      client,
+      id_usuario: id,
+    });
+
+    await client.query('COMMIT');
 
     return res.json({
       ok: true,
@@ -519,11 +674,15 @@ export const desactivarUsuario = async (req, res) => {
       usuario: resultado.rows[0],
     });
   } catch (error) {
+    await client.query('ROLLBACK');
+
     console.error('Error al desactivar usuario:', error);
 
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al desactivar usuario',
     });
+  } finally {
+    client.release();
   }
 };

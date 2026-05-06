@@ -1,0 +1,2 @@
+ALTER TABLE compras
+ADD COLUMN IF NOT EXISTS ticket_url TEXT;

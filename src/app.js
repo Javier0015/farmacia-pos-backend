@@ -1,6 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 import sucursalesRoutes from './routes/sucursales.routes.js';
 import categoriasRoutes from './routes/categorias.routes.js';
 import productosRoutes from './routes/productos.routes.js';
@@ -14,13 +17,27 @@ import usuariosRoutes from './routes/usuarios.routes.js';
 import cajasAdminRoutes from './routes/cajas.admin.routes.js';
 import tarjetasPuntosRoutes from './routes/tarjetasPuntos.routes.js';
 import authRoutes from './routes/auth.routes.js';
+import alertasRoutes from './routes/alertas.routes.js';
+import chatRoutes from './routes/chat.routes.js';
+import configuracionPuntosRoutes from './routes/configuracionPuntos.routes.js';
+import doctoresRoutes from './routes/doctores.routes.js';
+import recetasDoctorRoutes from './routes/recetasDoctor.routes.js';
+import ofertasCategoriasRoutes from './routes/ofertasCategorias.routes.js';
 
 const app = express();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Middlewares
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
+
+// Archivos públicos subidos
+// Ruta física: backend/uploads
+// URL pública: http://localhost:3001/uploads/...
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Ruta inicial
 app.get('/', (req, res) => {
@@ -53,5 +70,11 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/usuarios', usuariosRoutes);
 app.use('/api/admin/cajas', cajasAdminRoutes);
 app.use('/api/tarjetas-puntos', tarjetasPuntosRoutes);
+app.use('/api/alertas', alertasRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/configuracion-puntos', configuracionPuntosRoutes);
+app.use('/api/doctores', doctoresRoutes);
+app.use('/api/recetas-doctor', recetasDoctorRoutes);
+app.use('/api/ofertas-categorias', ofertasCategoriasRoutes);
 
 export default app;

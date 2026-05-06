@@ -8,6 +8,7 @@ import {
   listarLotesProducto,
   listarCaducidadProxima,
   bajaLotePorCaducidad,
+  consultarStockSucursales,
 } from '../controllers/inventario.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
@@ -23,5 +24,7 @@ router.get('/caducidad-proxima', verificarToken, listarCaducidadProxima);
 router.post('/asignar', verificarToken, asignarInventario);
 router.post('/ajustar', verificarToken, ajustarInventario);
 router.post('/baja-caducidad', verificarToken, bajaLotePorCaducidad);
+
+router.get('/stock-sucursales', verificarToken, consultarStockSucursales);
 
 export default router;

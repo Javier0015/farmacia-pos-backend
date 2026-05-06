@@ -26,17 +26,35 @@ export const crearCompra = async (req, res) => {
   const client = await pool.connect();
 
   try {
+    let body = req.body;
+
+    if (req.body.data) {
+      try {
+        body = JSON.parse(req.body.data);
+      } catch (error) {
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El formato de los datos de la compra no es válido',
+        });
+      }
+    }
+
     const {
       id_sucursal,
       id_proveedor,
-      productos,
+      productos = [],
       impuesto = 0,
       descuento = 0,
+      total_manual = 0,
       metodo_pago = 'PENDIENTE',
       monto_pagado = 0,
       id_sesion = null,
       observaciones,
-    } = req.body;
+    } = body;
+
+    const ticketProveedorUrl = req.file
+      ? `/uploads/tickets_proveedor/${req.file.filename}`
+      : null;
 
     if (!id_sucursal || !id_proveedor) {
       return res.status(400).json({
@@ -45,10 +63,10 @@ export const crearCompra = async (req, res) => {
       });
     }
 
-    if (!Array.isArray(productos) || productos.length === 0) {
+    if (!Array.isArray(productos)) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'La compra debe tener al menos un producto',
+        mensaje: 'El campo productos debe ser un arreglo',
       });
     }
 
@@ -212,7 +230,12 @@ export const crearCompra = async (req, res) => {
 
     const impuestoNum = Number(impuesto || 0);
     const descuentoNum = Number(descuento || 0);
-    const totalCompra = subtotalCompra - descuentoNum + impuestoNum;
+    const totalManualNum = Number(total_manual || 0);
+
+    const totalCompra =
+      productosProcesados.length === 0
+        ? totalManualNum - descuentoNum + impuestoNum
+        : subtotalCompra - descuentoNum + impuestoNum;
 
     if (totalCompra < 0) {
       await client.query('ROLLBACK');
@@ -273,9 +296,10 @@ export const crearCompra = async (req, res) => {
         metodo_pago,
         estado,
         id_sesion,
-        observaciones
+        observaciones,
+        ticket_proveedor_url
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING *
       `,
       [
@@ -293,6 +317,7 @@ export const crearCompra = async (req, res) => {
         estado,
         id_sesion,
         observaciones || null,
+        ticketProveedorUrl,
       ]
     );
 
@@ -591,6 +616,7 @@ export const listarCompras = async (req, res) => {
         c.estado,
         c.id_sesion,
         c.observaciones,
+        c.ticket_proveedor_url,
         c.fecha_compra
       FROM compras c
       INNER JOIN sucursales s ON s.id_sucursal = c.id_sucursal
@@ -670,6 +696,7 @@ export const obtenerCompra = async (req, res) => {
         c.estado,
         c.id_sesion,
         c.observaciones,
+        c.ticket_proveedor_url,
         c.fecha_compra
       FROM compras c
       INNER JOIN sucursales s ON s.id_sucursal = c.id_sucursal
