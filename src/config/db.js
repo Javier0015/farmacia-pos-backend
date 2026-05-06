@@ -5,6 +5,33 @@ dotenv.config();
 
 const { Pool } = pg;
 
+if (!process.env.DATABASE_URL) {
+  console.error('Falta la variable DATABASE_URL');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+pool.on('error', (err) => {
+  console.error('Error inesperado en PostgreSQL:', err);
+});
+
+export default pool;
+export { pool };
+
+
+/*import pg from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const { Pool } = pg;
+
 export const pool = new Pool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -22,4 +49,4 @@ export const probarConexion = async () => {
     console.error(error.message);
     process.exit(1);
   }
-};
+};*/

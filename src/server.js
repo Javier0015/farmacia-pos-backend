@@ -1,4 +1,15 @@
-import dotenv from 'dotenv';
+import pool from './config/db.js';
+
+try {
+  await pool.query('SELECT NOW()');
+  console.log('Conectado a PostgreSQL correctamente');
+} catch (error) {
+  console.error('Error al conectar con PostgreSQL:', error.message);
+  process.exit(1);
+}
+
+
+/*import dotenv from 'dotenv';
 import app from './app.js';
 import { probarConexion } from './config/db.js';
 
@@ -15,4 +26,4 @@ const iniciarServidor = async () => {
   });
 };
 
-iniciarServidor();
+iniciarServidor();*/
