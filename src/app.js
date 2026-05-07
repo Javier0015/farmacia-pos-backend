@@ -23,6 +23,8 @@ import configuracionPuntosRoutes from './routes/configuracionPuntos.routes.js';
 import doctoresRoutes from './routes/doctores.routes.js';
 import recetasDoctorRoutes from './routes/recetasDoctor.routes.js';
 import ofertasCategoriasRoutes from './routes/ofertasCategorias.routes.js';
+import catalogoRoutes from './routes/catalogo.routes.js';
+import catalogoPublicoRoutes from './routes/catalogoPublico.routes.js';
 
 const app = express();
 
@@ -76,5 +78,8 @@ app.use('/api/configuracion-puntos', configuracionPuntosRoutes);
 app.use('/api/doctores', doctoresRoutes);
 app.use('/api/recetas-doctor', recetasDoctorRoutes);
 app.use('/api/ofertas-categorias', ofertasCategoriasRoutes);
+app.use('/api/catalogo', catalogoRoutes);
+app.use('/api/public/catalogo', catalogoPublicoRoutes);
+
 
 export default app;
