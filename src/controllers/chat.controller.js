@@ -1,5 +1,7 @@
 import { pool } from '../config/db.js';
 
+const DIAS_HISTORIAL_CHAT = 7;
+
 const obtenerRolUsuario = (usuario) => {
   return String(usuario?.rol || usuario?.perfil || '').toUpperCase();
 };
@@ -61,6 +63,12 @@ const construirFiltroMensajes = () => {
   `;
 };
 
+const construirFiltroHistorialReciente = () => {
+  return `
+    AND cm.fecha_envio >= NOW() - ($5::int * INTERVAL '1 day')
+  `;
+};
+
 export const listarMensajesChat = async (req, res) => {
   try {
     const idUsuario = req.usuario.id_usuario;
@@ -102,6 +110,7 @@ export const listarMensajesChat = async (req, res) => {
         ON cl.id_mensaje = cm.id_mensaje
        AND cl.id_usuario = $1
       WHERE ${construirFiltroMensajes()}
+        ${construirFiltroHistorialReciente()}
       ORDER BY cm.fecha_envio ASC
       LIMIT 150
       `,
@@ -110,11 +119,13 @@ export const listarMensajesChat = async (req, res) => {
         rolUsuario,
         esSuperAdmin,
         sucursalesUsuario,
+        DIAS_HISTORIAL_CHAT,
       ]
     );
 
     return res.json({
       ok: true,
+      dias_historial: DIAS_HISTORIAL_CHAT,
       mensajes: resultado.rows,
     });
   } catch (error) {
@@ -144,12 +155,14 @@ export const contarMensajesNoLeidos = async (req, res) => {
       WHERE ${construirFiltroMensajes()}
         AND cm.id_usuario_emisor <> $1
         AND cl.id_lectura IS NULL
+        ${construirFiltroHistorialReciente()}
       `,
       [
         idUsuario,
         rolUsuario,
         esSuperAdmin,
         sucursalesUsuario,
+        DIAS_HISTORIAL_CHAT,
       ]
     );
 
@@ -326,6 +339,7 @@ export const marcarMensajesComoLeidos = async (req, res) => {
       WHERE ${construirFiltroMensajes()}
         AND cm.id_usuario_emisor <> $1
         AND cl.id_lectura IS NULL
+        ${construirFiltroHistorialReciente()}
       ON CONFLICT (id_mensaje, id_usuario) DO NOTHING
       `,
       [
@@ -333,12 +347,13 @@ export const marcarMensajesComoLeidos = async (req, res) => {
         rolUsuario,
         esSuperAdmin,
         sucursalesUsuario,
+        DIAS_HISTORIAL_CHAT,
       ]
     );
 
     return res.json({
       ok: true,
-      mensaje: 'Mensajes marcados como leídos',
+      mensaje: 'Mensajes recientes marcados como leídos',
     });
   } catch (error) {
     console.error('Error al marcar mensajes como leídos:', error);

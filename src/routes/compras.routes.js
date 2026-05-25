@@ -3,6 +3,8 @@ import {
   crearCompra,
   listarCompras,
   obtenerCompra,
+  actualizarCompra,
+  cancelarCompra,
 } from '../controllers/compras.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
@@ -20,4 +22,17 @@ router.post(
   crearCompra
 );
 
-export default router;  
+router.put(
+  '/:id',
+  verificarToken,
+  uploadTicketProveedor.single('ticket'),
+  actualizarCompra
+);
+
+router.patch(
+  '/:id/cancelar',
+  verificarToken,
+  cancelarCompra
+);
+
+export default router;

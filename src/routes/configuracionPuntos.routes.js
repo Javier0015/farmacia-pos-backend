@@ -9,6 +9,9 @@ import {
   canjearPuntosCajero,
   listarResumenPuntosDoctores,
   canjearPuntosDoctor,
+  listarResumenDoctoresShaddai,
+  actualizarPorcentajeDoctorShaddai,
+  canjearPuntosDoctorShaddai,
 } from '../controllers/configuracionPuntos.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
@@ -29,6 +32,13 @@ router.post('/cajeros/:id_usuario/canjear', verificarToken, canjearPuntosCajero)
 
 router.get('/doctores/resumen', verificarToken, listarResumenPuntosDoctores);
 
-router.post('/doctores/:id_doctor/canjear', verificarToken, canjearPuntosDoctor)
+router.post('/doctores/:id_doctor/canjear', verificarToken, canjearPuntosDoctor);
+
+router.get('/doctores-shaddai/resumen', verificarToken, listarResumenDoctoresShaddai
+);
+
+router.put('/doctores-shaddai/:id_doctor/porcentaje', verificarToken, actualizarPorcentajeDoctorShaddai);
+
+router.post('/doctores-shaddai/:id_doctor/canjear', verificarToken, canjearPuntosDoctorShaddai);
 
 export default router;

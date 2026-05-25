@@ -6,6 +6,7 @@ import {
   listarMisAlertas,
   contarAlertasNoLeidas,
   marcarAlertaComoLeida,
+  marcarTodasAlertasComoLeidas,
   desactivarAlerta,
 } from '../controllers/alertas.controller.js';
 
@@ -20,6 +21,8 @@ router.get('/mis-alertas', verificarToken, listarMisAlertas);
 router.get('/no-leidas', verificarToken, contarAlertasNoLeidas);
 
 router.post('/', verificarToken, crearAlerta);
+
+router.put('/leer-todas', verificarToken, marcarTodasAlertasComoLeidas);
 
 router.put('/:id/leer', verificarToken, marcarAlertaComoLeida);
 

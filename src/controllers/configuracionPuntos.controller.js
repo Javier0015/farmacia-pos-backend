@@ -682,3 +682,310 @@ export const canjearPuntosDoctor = async (req, res) => {
     client.release();
   }
 };
+
+
+// =====================================================
+// DOCTORES SHADDAI - RESUMEN DE PUNTOS
+// =====================================================
+export const listarResumenDoctoresShaddai = async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        d.id_perfil AS id_doctor,
+        d.id_usuario,
+        d.nombre_completo,
+        d.cedula_profesional,
+        d.especialidad,
+        d.telefono,
+        d.correo,
+        d.direccion_consultorio,
+        d.observaciones,
+        d.perfil_completo,
+        d.activo,
+        COALESCE(d.porcentaje_puntos_venta, 0) AS porcentaje_puntos_venta,
+        COALESCE(d.puntos_activo, true) AS puntos_activo,
+        u.usuario,
+
+        COALESCE(SUM(m.puntos), 0) AS puntos_actuales,
+
+        COALESCE(SUM(
+          CASE
+            WHEN m.tipo_movimiento <> 'CANJE'
+              THEN ABS(m.puntos)
+            ELSE 0
+          END
+        ), 0) AS puntos_acumulados,
+
+        COALESCE(SUM(
+          CASE
+            WHEN m.tipo_movimiento = 'CANJE'
+              THEN ABS(m.puntos)
+            ELSE 0
+          END
+        ), 0) AS puntos_canjeados,
+
+        COUNT(DISTINCT m.id_venta) AS ventas_referidas,
+
+        MAX(m.fecha_movimiento) AS ultimo_movimiento
+
+      FROM doctores_shaddai_perfiles d
+
+      LEFT JOIN usuarios u 
+        ON u.id_usuario = d.id_usuario
+
+      LEFT JOIN doctores_puntos_movimientos m 
+        ON m.id_doctor = d.id_perfil
+        AND COALESCE(m.origen_doctor, 'EXTERNO') = 'SHADDAI'
+
+      GROUP BY
+        d.id_perfil,
+        d.id_usuario,
+        d.nombre_completo,
+        d.cedula_profesional,
+        d.especialidad,
+        d.telefono,
+        d.correo,
+        d.direccion_consultorio,
+        d.observaciones,
+        d.perfil_completo,
+        d.activo,
+        d.porcentaje_puntos_venta,
+        d.puntos_activo,
+        u.usuario
+
+      ORDER BY d.nombre_completo ASC;
+    `;
+
+    const { rows } = await pool.query(query);
+
+    return res.json({
+      ok: true,
+      doctores: rows,
+    });
+  } catch (error) {
+    console.error('Error al listar resumen de doctores Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo obtener el resumen de puntos de doctores Shaddai.',
+      error: error.message,
+    });
+  }
+};
+
+
+// =====================================================
+// DOCTORES SHADDAI - ACTUALIZAR PORCENTAJE INDIVIDUAL
+// =====================================================
+export const actualizarPorcentajeDoctorShaddai = async (req, res) => {
+  try {
+    const { id_doctor } = req.params;
+    const { porcentaje_puntos_venta, puntos_activo } = req.body;
+
+    const porcentaje = Number(porcentaje_puntos_venta || 0);
+
+    if (!id_doctor) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El ID del doctor es obligatorio.',
+      });
+    }
+
+    if (Number.isNaN(porcentaje) || porcentaje < 0 || porcentaje > 100) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El porcentaje debe estar entre 0 y 100.',
+      });
+    }
+
+    const existeDoctor = await pool.query(
+      `
+      SELECT id_perfil
+      FROM doctores_shaddai_perfiles
+      WHERE id_perfil = $1
+      LIMIT 1
+      `,
+      [id_doctor]
+    );
+
+    if (existeDoctor.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró el doctor Shaddai.',
+      });
+    }
+
+    const activo =
+      puntos_activo === true ||
+      puntos_activo === 'true' ||
+      puntos_activo === 1 ||
+      puntos_activo === '1';
+
+    const { rows } = await pool.query(
+      `
+      UPDATE doctores_shaddai_perfiles
+      SET
+        porcentaje_puntos_venta = $1,
+        puntos_activo = $2,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_perfil = $3
+      RETURNING
+        id_perfil AS id_doctor,
+        id_usuario,
+        nombre_completo,
+        cedula_profesional,
+        especialidad,
+        telefono,
+        correo,
+        direccion_consultorio,
+        observaciones,
+        perfil_completo,
+        activo,
+        porcentaje_puntos_venta,
+        puntos_activo,
+        fecha_actualizacion
+      `,
+      [porcentaje, activo, id_doctor]
+    );
+
+    return res.json({
+      ok: true,
+      mensaje: 'Porcentaje actualizado correctamente.',
+      doctor: rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar porcentaje del doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo actualizar el porcentaje del doctor Shaddai.',
+      error: error.message,
+    });
+  }
+};
+
+// =====================================================
+// DOCTORES SHADDAI - CANJEAR PUNTOS
+// =====================================================
+export const canjearPuntosDoctorShaddai = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id_doctor } = req.params;
+    const { descripcion } = req.body;
+
+    if (!id_doctor) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El ID del doctor es obligatorio.',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const doctorResult = await client.query(
+      `
+      SELECT
+        id_perfil AS id_doctor,
+        id_usuario,
+        nombre_completo
+      FROM doctores_shaddai_perfiles
+      WHERE id_perfil = $1
+      LIMIT 1
+      `,
+      [id_doctor]
+    );
+
+    if (doctorResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró el doctor Shaddai.',
+      });
+    }
+
+    const doctor = doctorResult.rows[0];
+
+    const saldoResult = await client.query(
+      `
+      SELECT
+        COALESCE(SUM(puntos), 0) AS saldo
+      FROM doctores_puntos_movimientos
+      WHERE id_doctor = $1
+        AND COALESCE(origen_doctor, 'EXTERNO') = 'SHADDAI'
+      `,
+      [id_doctor]
+    );
+
+    const saldo = Number(saldoResult.rows[0]?.saldo || 0);
+
+    if (saldo <= 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Este doctor Shaddai no tiene puntos disponibles para canjear.',
+      });
+    }
+
+    const idUsuarioMovimiento =
+      req.usuario?.id_usuario ||
+      req.user?.id_usuario ||
+      doctor.id_usuario;
+
+    await client.query(
+      `
+      INSERT INTO doctores_puntos_movimientos (
+        id_doctor,
+        id_usuario,
+        id_receta,
+        id_venta,
+        origen_doctor,
+        tipo_movimiento,
+        puntos,
+        descripcion,
+        fecha_movimiento
+      )
+      VALUES (
+        $1,
+        $2,
+        NULL,
+        NULL,
+        'SHADDAI',
+        'CANJE',
+        $3,
+        $4,
+        CURRENT_TIMESTAMP
+      )
+      `,
+      [
+        id_doctor,
+        idUsuarioMovimiento,
+        saldo * -1,
+        descripcion ||
+          `Canje de puntos del doctor Shaddai ${doctor.nombre_completo || id_doctor}`,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      mensaje: 'Puntos canjeados correctamente.',
+      puntos_canjeados: saldo,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Error al canjear puntos del doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudieron canjear los puntos del doctor Shaddai.',
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+};

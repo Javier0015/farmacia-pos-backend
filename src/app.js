@@ -25,6 +25,15 @@ import recetasDoctorRoutes from './routes/recetasDoctor.routes.js';
 import ofertasCategoriasRoutes from './routes/ofertasCategorias.routes.js';
 import catalogoRoutes from './routes/catalogo.routes.js';
 import catalogoPublicoRoutes from './routes/catalogoPublico.routes.js';
+import doctorShaddaiRoutes from './routes/doctorShaddai.routes.js';
+import doctorFilaRoutes from './routes/doctorFila.routes.js';
+import laboratorioRoutes from './routes/laboratorio.routes.js';
+import notasMedicasRoutes from './routes/notasMedicas.routes.js';
+import referenciasRoutes from './routes/referencias.routes.js';
+import violenciaLesionRoutes from './routes/violenciaLesion.routes.js';
+import consentimientosRoutes from './routes/consentimientos.routes.js';
+import documentosClinicosRoutes from './routes/documentosClinicos.routes.js';
+
 
 const app = express();
 
@@ -80,6 +89,15 @@ app.use('/api/recetas-doctor', recetasDoctorRoutes);
 app.use('/api/ofertas-categorias', ofertasCategoriasRoutes);
 app.use('/api/catalogo', catalogoRoutes);
 app.use('/api/public/catalogo', catalogoPublicoRoutes);
+app.use('/api/doctor-shaddai', doctorShaddaiRoutes);
+app.use('/api/doctor-fila', doctorFilaRoutes);
+app.use('/api/laboratorio', laboratorioRoutes);
+app.use('/api/notas-medicas', notasMedicasRoutes);
+app.use('/api/referencias', referenciasRoutes);
+app.use('/api/violencia-lesion', violenciaLesionRoutes);
+app.use('/api/consentimientos', consentimientosRoutes);
+app.use('/api/documentos-clinicos', documentosClinicosRoutes);
+
 
 
 export default app;

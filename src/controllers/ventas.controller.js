@@ -104,6 +104,104 @@ const descontarLotesFEFO = async ({
   };
 };
 
+const descontarLoteSeleccionado = async ({
+  client,
+  id_sucursal,
+  id_producto,
+  id_lote,
+  cantidadVenta,
+}) => {
+  const cantidadADescontar = Number(cantidadVenta);
+
+  const loteResultado = await client.query(
+    `
+    SELECT
+      id_lote,
+      id_sucursal,
+      id_producto,
+      lote,
+      fecha_caducidad,
+      stock_actual,
+      activo
+    FROM inventario_lotes
+    WHERE id_lote = $1
+      AND id_sucursal = $2
+      AND id_producto = $3
+    FOR UPDATE
+    `,
+    [id_lote, id_sucursal, id_producto]
+  );
+
+  if (loteResultado.rows.length === 0) {
+    return {
+      ok: false,
+      mensaje:
+        'El lote seleccionado no existe o no pertenece al producto/sucursal',
+      lotes_descontados: [],
+    };
+  }
+
+  const loteItem = loteResultado.rows[0];
+
+  if (!loteItem.activo) {
+    return {
+      ok: false,
+      mensaje: `El lote ${loteItem.lote} está inactivo`,
+      lotes_descontados: [],
+    };
+  }
+
+  const stockLoteAnterior = Number(loteItem.stock_actual || 0);
+
+  if (stockLoteAnterior <= 0) {
+    return {
+      ok: false,
+      mensaje: `El lote ${loteItem.lote} no tiene stock disponible`,
+      stock_lote: stockLoteAnterior,
+      cantidad_solicitada: cantidadADescontar,
+      lotes_descontados: [],
+    };
+  }
+
+  if (stockLoteAnterior < cantidadADescontar) {
+    return {
+      ok: false,
+      mensaje: `Stock insuficiente en el lote ${loteItem.lote}`,
+      stock_lote: stockLoteAnterior,
+      cantidad_solicitada: cantidadADescontar,
+      lotes_descontados: [],
+    };
+  }
+
+  const stockLoteNuevo = stockLoteAnterior - cantidadADescontar;
+
+  await client.query(
+    `
+    UPDATE inventario_lotes
+    SET
+      stock_actual = $1::numeric,
+      activo = CASE WHEN $1::numeric <= 0::numeric THEN false ELSE true END,
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE id_lote = $2
+    `,
+    [stockLoteNuevo, loteItem.id_lote]
+  );
+
+  return {
+    ok: true,
+    lotes_descontados: [
+      {
+        id_lote: loteItem.id_lote,
+        lote: loteItem.lote,
+        fecha_caducidad: loteItem.fecha_caducidad,
+        cantidad_descontada: cantidadADescontar,
+        stock_lote_anterior: stockLoteAnterior,
+        stock_lote_nuevo: stockLoteNuevo,
+      },
+    ],
+  };
+};
+
 const obtenerConfiguracionPuntos = async (client) => {
   const resultado = await client.query(
     `
@@ -192,6 +290,60 @@ const validarOfertaProducto = async ({
   return ofertaResultado.rows[0];
 };
 
+const actualizarEstatusRecetaShaddai = async ({ client, idReceta }) => {
+  if (!idReceta) return null;
+
+  const resumenDetalle = await client.query(
+    `
+    SELECT
+      COUNT(*)::int AS total_productos,
+      SUM(
+        CASE
+          WHEN COALESCE(cantidad_surtida, 0) >= COALESCE(cantidad, 0)
+            THEN 1
+          ELSE 0
+        END
+      )::int AS productos_completos,
+      SUM(COALESCE(cantidad, 0))::numeric AS total_recetado,
+      SUM(COALESCE(cantidad_surtida, 0))::numeric AS total_surtido
+    FROM recetas_shaddai_detalle
+    WHERE id_receta = $1
+    `,
+    [idReceta]
+  );
+
+  const resumen = resumenDetalle.rows[0];
+
+  const totalProductos = Number(resumen?.total_productos || 0);
+  const productosCompletos = Number(resumen?.productos_completos || 0);
+  const totalSurtido = Number(resumen?.total_surtido || 0);
+
+  let estatus = 'PENDIENTE_CAJERO';
+
+  if (totalProductos > 0 && productosCompletos === totalProductos) {
+    estatus = 'SURTIDA';
+  } else if (totalSurtido > 0) {
+    estatus = 'SURTIDA_PARCIAL';
+  }
+
+  const recetaActualizada = await client.query(
+    `
+    UPDATE recetas_shaddai
+    SET
+      estatus = $1,
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE id_receta = $2
+    RETURNING
+      id_receta,
+      folio_receta,
+      estatus
+    `,
+    [estatus, idReceta]
+  );
+
+  return recetaActualizada.rows[0] || null;
+};
+
 export const crearVenta = async (req, res) => {
   const client = await pool.connect();
 
@@ -206,6 +358,8 @@ export const crearVenta = async (req, res) => {
       impuesto = 0,
       productos,
       id_tarjeta_puntos,
+      id_doctor,
+      id_receta_shaddai,
     } = req.body;
 
     if (!id_sucursal || !id_caja || !id_sesion) {
@@ -326,24 +480,101 @@ export const crearVenta = async (req, res) => {
       });
     }
 
+    let doctorShaddaiVenta = null;
+
+    const idRecetaShaddaiVenta = id_receta_shaddai
+      ? Number(id_receta_shaddai)
+      : productos.find((item) => item.id_receta_shaddai)?.id_receta_shaddai
+        ? Number(productos.find((item) => item.id_receta_shaddai)?.id_receta_shaddai)
+        : null;
+
+    let idDoctorVenta = id_doctor ? Number(id_doctor) : null;
+
+    if (!idDoctorVenta && idRecetaShaddaiVenta) {
+      const recetaDoctorResultado = await client.query(
+        `
+        SELECT
+          id_doctor
+        FROM recetas_shaddai
+        WHERE id_receta = $1
+        LIMIT 1
+        `,
+        [idRecetaShaddaiVenta]
+      );
+
+      if (recetaDoctorResultado.rows.length > 0) {
+        idDoctorVenta = recetaDoctorResultado.rows[0].id_doctor
+          ? Number(recetaDoctorResultado.rows[0].id_doctor)
+          : null;
+      }
+    }
+
+    if (idDoctorVenta) {
+      const doctorResultado = await client.query(
+        `
+        SELECT
+          id_perfil,
+          id_usuario,
+          nombre_completo,
+          porcentaje_puntos_venta,
+          puntos_activo,
+          activo
+        FROM doctores_shaddai_perfiles
+        WHERE id_perfil = $1
+           OR id_usuario = $1
+        LIMIT 1
+        `,
+        [idDoctorVenta]
+      );
+
+      if (doctorResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'No se encontró el doctor Shaddai asociado a la venta.',
+        });
+      }
+
+      doctorShaddaiVenta = doctorResultado.rows[0];
+
+      // Normalizamos el valor para que ventas.id_doctor guarde siempre id_perfil,
+      // aunque recetas_shaddai.id_doctor venga como id_usuario.
+      idDoctorVenta = Number(doctorShaddaiVenta.id_perfil);
+
+      if (!esValorActivo(doctorShaddaiVenta.activo)) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El doctor Shaddai asociado a la venta está inactivo.',
+        });
+      }
+    }
+
     let subtotalVenta = 0;
     let subtotalSinDescuentoVenta = 0;
     let descuentoOfertasVenta = 0;
 
     let puntosClienteGanados = 0;
     let puntosCajeroGanados = 0;
+    let puntosDoctorShaddaiGanados = 0;
+    let doctorShaddaiPuntos = null;
+    let recetaShaddaiActualizada = null;
 
     const productosProcesados = [];
 
     for (const item of productos) {
       const { id_producto, cantidad } = item;
+      const idLoteSeleccionado = item.id_lote ? Number(item.id_lote) : null;
 
       if (!id_producto || !cantidad || Number(cantidad) <= 0) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
-          mensaje: 'Cada producto debe tener id_producto y cantidad mayor a cero',
+          mensaje:
+            'Cada producto debe tener id_producto y cantidad mayor a cero',
         });
       }
 
@@ -504,12 +735,20 @@ export const crearVenta = async (req, res) => {
         });
       }
 
-      const resultadoLotes = await descontarLotesFEFO({
-        client,
-        id_sucursal,
-        id_producto,
-        cantidadVenta,
-      });
+      const resultadoLotes = idLoteSeleccionado
+        ? await descontarLoteSeleccionado({
+            client,
+            id_sucursal,
+            id_producto,
+            id_lote: idLoteSeleccionado,
+            cantidadVenta,
+          })
+        : await descontarLotesFEFO({
+            client,
+            id_sucursal,
+            id_producto,
+            cantidadVenta,
+          });
 
       if (!resultadoLotes.ok) {
         await client.query('ROLLBACK');
@@ -518,6 +757,7 @@ export const crearVenta = async (req, res) => {
           ok: false,
           mensaje: `${resultadoLotes.mensaje} para ${producto.nombre}`,
           stock_lotes: resultadoLotes.stock_lotes,
+          stock_lote: resultadoLotes.stock_lote,
           cantidad_solicitada: resultadoLotes.cantidad_solicitada,
         });
       }
@@ -540,8 +780,14 @@ export const crearVenta = async (req, res) => {
       subtotalSinDescuentoVenta += subtotalOriginalProducto;
       descuentoOfertasVenta += descuentoOfertaProducto;
 
+      const lotePrincipal = resultadoLotes.lotes_descontados?.[0] || null;
+
       productosProcesados.push({
         id_producto,
+        id_lote: lotePrincipal?.id_lote || null,
+        lote: lotePrincipal?.lote || null,
+        fecha_caducidad: lotePrincipal?.fecha_caducidad || null,
+
         nombre: producto.nombre,
         cantidad: cantidadVenta,
 
@@ -563,6 +809,14 @@ export const crearVenta = async (req, res) => {
         stock_anterior: stockActual,
         stock_nuevo: stockNuevo,
         lotes_descontados: resultadoLotes.lotes_descontados,
+
+        id_receta_shaddai: item.id_receta_shaddai
+          ? Number(item.id_receta_shaddai)
+          : null,
+
+        id_detalle_receta_shaddai: item.id_detalle_receta_shaddai
+          ? Number(item.id_detalle_receta_shaddai)
+          : null,
       });
     }
 
@@ -572,7 +826,9 @@ export const crearVenta = async (req, res) => {
 
     const descuentoVenta = redondearDos(descuento || 0);
     const impuestoVenta = redondearDos(impuesto || 0);
-    const totalVenta = redondearDos(subtotalVenta - descuentoVenta + impuestoVenta);
+    const totalVenta = redondearDos(
+      subtotalVenta - descuentoVenta + impuestoVenta
+    );
 
     if (totalVenta < 0) {
       await client.query('ROLLBACK');
@@ -662,9 +918,15 @@ export const crearVenta = async (req, res) => {
         puntos_ganados,
         monto_pagado_dinero,
         monto_pagado_puntos,
-        puntos_usados
+        puntos_usados,
+        id_doctor
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'COMPLETADA',$15,$16,$17,$18,$19)
+      VALUES (
+        $1,$2,$3,$4,$5,
+        $6,$7,$8,$9,$10,
+        $11,$12,$13,$14,'COMPLETADA',
+        $15,$16,$17,$18,$19,$20
+      )
       RETURNING *
       `,
       [
@@ -687,10 +949,73 @@ export const crearVenta = async (req, res) => {
         montoPagadoDinero,
         montoPagadoPuntos,
         puntosUsados,
+        idDoctorVenta || null,
       ]
     );
 
     const venta = ventaResultado.rows[0];
+
+    if (doctorShaddaiVenta) {
+      const porcentajeDoctor = Number(
+        doctorShaddaiVenta.porcentaje_puntos_venta || 0
+      );
+
+      if (
+        esValorActivo(doctorShaddaiVenta.puntos_activo) &&
+        porcentajeDoctor > 0 &&
+        totalVenta > 0
+      ) {
+        puntosDoctorShaddaiGanados = calcularPuntosPorcentaje({
+          total: totalVenta,
+          porcentaje: porcentajeDoctor,
+          activo: true,
+        });
+
+        if (puntosDoctorShaddaiGanados > 0) {
+          await client.query(
+            `
+            INSERT INTO doctores_puntos_movimientos (
+              id_doctor,
+              id_usuario,
+              id_receta,
+              id_venta,
+              tipo_movimiento,
+              puntos,
+              descripcion,
+              fecha_movimiento,
+              origen_doctor
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4,
+              'ACUMULACION_VENTA_SHADDAI',
+              $5,
+              $6,
+              CURRENT_TIMESTAMP,
+              'SHADDAI'
+            )
+            `,
+            [
+              doctorShaddaiVenta.id_perfil,
+              doctorShaddaiVenta.id_usuario,
+              null,
+              venta.id_venta,
+              puntosDoctorShaddaiGanados,
+              `Puntos generados por venta ${folio} | Doctor Shaddai ${doctorShaddaiVenta.nombre_completo} | Receta Shaddai #${idRecetaShaddaiVenta || 'N/A'} | ${porcentajeDoctor}% sobre $${totalVenta.toFixed(2)}`,
+            ]
+          );
+
+          doctorShaddaiPuntos = {
+            id_doctor: doctorShaddaiVenta.id_perfil,
+            nombre_completo: doctorShaddaiVenta.nombre_completo,
+            porcentaje_puntos_venta: porcentajeDoctor,
+            puntos_ganados: puntosDoctorShaddaiGanados,
+          };
+        }
+      }
+    }
 
     for (const item of productosProcesados) {
       await client.query(
@@ -698,6 +1023,7 @@ export const crearVenta = async (req, res) => {
         INSERT INTO venta_detalle (
           id_venta,
           id_producto,
+          id_lote,
           cantidad,
           precio_unitario,
           precio_original,
@@ -705,13 +1031,18 @@ export const crearVenta = async (req, res) => {
           descuento_unitario,
           id_oferta,
           descuento,
-          subtotal
+          subtotal,
+          id_receta_shaddai,
+          id_detalle_receta_shaddai
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+        )
         `,
         [
           venta.id_venta,
           item.id_producto,
+          item.id_lote,
           item.cantidad,
           item.precio_unitario,
           item.precio_original,
@@ -720,8 +1051,31 @@ export const crearVenta = async (req, res) => {
           item.id_oferta,
           item.descuento,
           item.subtotal,
+          item.id_receta_shaddai,
+          item.id_detalle_receta_shaddai,
         ]
       );
+
+      if (item.id_receta_shaddai && item.id_detalle_receta_shaddai) {
+        await client.query(
+          `
+          UPDATE recetas_shaddai_detalle
+          SET
+            cantidad_surtida = LEAST(
+              COALESCE(cantidad, 0),
+              COALESCE(cantidad_surtida, 0) + $1
+            ),
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_detalle = $2
+            AND id_receta = $3
+          `,
+          [
+            Number(item.cantidad || 0),
+            item.id_detalle_receta_shaddai,
+            item.id_receta_shaddai,
+          ]
+        );
+      }
 
       for (const loteDesc of item.lotes_descontados) {
         await client.query(
@@ -753,6 +1107,21 @@ export const crearVenta = async (req, res) => {
           ]
         );
       }
+    }
+
+    const recetasShaddaiVendidas = [
+      ...new Set(
+        productosProcesados
+          .map((item) => item.id_receta_shaddai)
+          .filter(Boolean)
+      ),
+    ];
+
+    for (const idRecetaVendida of recetasShaddaiVendidas) {
+      recetaShaddaiActualizada = await actualizarEstatusRecetaShaddai({
+        client,
+        idReceta: idRecetaVendida,
+      });
     }
 
     let tarjetaActualizada = null;
@@ -886,7 +1255,7 @@ export const crearVenta = async (req, res) => {
       );
     }
 
-    const montoMovimientoCaja = esPagoConPuntos ? 0 : totalVenta;
+    const montoMovimientoCaja = metodoPagoFinal === 'EFECTIVO' ? totalVenta : 0;
 
     await client.query(
       `
@@ -912,9 +1281,9 @@ export const crearVenta = async (req, res) => {
         folio,
         tarjetaPuntos
           ? esPagoConPuntos
-            ? `Venta pagada con puntos | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos usados: ${puntosUsados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados}`
-            : `Venta registrada desde POS | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos cliente: ${puntosClienteGanados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados}`
-          : `Venta registrada desde POS | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados}`,
+            ? `Venta pagada con puntos | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos usados: ${puntosUsados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`
+            : `Venta registrada desde POS | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos cliente: ${puntosClienteGanados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`
+          : `Venta registrada desde POS | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`,
         req.usuario.id_usuario,
       ]
     );
@@ -928,6 +1297,8 @@ export const crearVenta = async (req, res) => {
         ...venta,
         productos: productosProcesados,
         tarjeta_puntos: tarjetaActualizada,
+        doctor_shaddai_puntos: doctorShaddaiPuntos,
+        receta_shaddai_actualizada: recetaShaddaiActualizada,
       },
       resumen: {
         subtotal: subtotalVenta,
@@ -945,6 +1316,9 @@ export const crearVenta = async (req, res) => {
         puntos_ganados: puntosClienteGanados,
         puntos_ganados_cliente: puntosClienteGanados,
         puntos_ganados_cajero: puntosCajeroGanados,
+        puntos_ganados_doctor_shaddai: puntosDoctorShaddaiGanados,
+        doctor_shaddai_puntos: doctorShaddaiPuntos,
+        estatus_receta_shaddai: recetaShaddaiActualizada?.estatus || null,
         tarjeta_puntos: tarjetaActualizada,
         configuracion_puntos: {
           porcentaje_cliente: configuracionPuntos.porcentaje_cliente,
@@ -1000,17 +1374,25 @@ export const listarVentas = async (req, res) => {
         tp.codigo_barras AS tarjeta_codigo_barras,
         tp.nombre_cliente AS tarjeta_cliente,
         v.puntos_ganados,
+        v.id_doctor,
+        dsp.nombre_completo AS doctor_shaddai,
         v.fecha_venta,
-        COALESCE(cpm.puntos, 0)::numeric(12,2) AS puntos_cajero
+        COALESCE(cpm.puntos, 0)::numeric(12,2) AS puntos_cajero,
+        COALESCE(dpm.puntos, 0)::numeric(12,2) AS puntos_doctor_shaddai
       FROM ventas v
       INNER JOIN sucursales s ON s.id_sucursal = v.id_sucursal
       INNER JOIN cajas c ON c.id_caja = v.id_caja
       INNER JOIN usuarios u ON u.id_usuario = v.id_usuario
       LEFT JOIN tarjetas_puntos tp ON tp.id_tarjeta = v.id_tarjeta_puntos
+      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_perfil = v.id_doctor
       LEFT JOIN cajeros_puntos_movimientos cpm 
         ON cpm.id_venta = v.id_venta 
        AND cpm.id_usuario = v.id_usuario
        AND cpm.tipo_movimiento = 'VENTA'
+      LEFT JOIN doctores_puntos_movimientos dpm
+        ON dpm.id_venta = v.id_venta
+       AND dpm.origen_doctor = 'SHADDAI'
+       AND dpm.tipo_movimiento = 'ACUMULACION_VENTA_SHADDAI'
       WHERE 1 = 1
     `;
 
@@ -1087,18 +1469,27 @@ export const obtenerVenta = async (req, res) => {
         tp.codigo_barras AS tarjeta_codigo_barras,
         tp.nombre_cliente AS tarjeta_cliente,
         v.puntos_ganados,
+        v.id_doctor,
+        dsp.nombre_completo AS doctor_shaddai,
         v.fecha_venta,
         COALESCE(cpm.puntos, 0)::numeric(12,2) AS puntos_cajero,
-        cpm.porcentaje_aplicado AS porcentaje_cajero_aplicado
+        cpm.porcentaje_aplicado AS porcentaje_cajero_aplicado,
+        COALESCE(dpm.puntos, 0)::numeric(12,2) AS puntos_doctor_shaddai,
+        dpm.descripcion AS descripcion_puntos_doctor_shaddai
       FROM ventas v
       INNER JOIN sucursales s ON s.id_sucursal = v.id_sucursal
       INNER JOIN cajas c ON c.id_caja = v.id_caja
       INNER JOIN usuarios u ON u.id_usuario = v.id_usuario
       LEFT JOIN tarjetas_puntos tp ON tp.id_tarjeta = v.id_tarjeta_puntos
+      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_perfil = v.id_doctor
       LEFT JOIN cajeros_puntos_movimientos cpm 
         ON cpm.id_venta = v.id_venta 
        AND cpm.id_usuario = v.id_usuario
        AND cpm.tipo_movimiento = 'VENTA'
+      LEFT JOIN doctores_puntos_movimientos dpm
+        ON dpm.id_venta = v.id_venta
+       AND dpm.origen_doctor = 'SHADDAI'
+       AND dpm.tipo_movimiento = 'ACUMULACION_VENTA_SHADDAI'
       WHERE v.id_venta = $1
       `,
       [id]
@@ -1116,6 +1507,11 @@ export const obtenerVenta = async (req, res) => {
       SELECT
         vd.id_detalle,
         vd.id_producto,
+        vd.id_lote,
+        vd.id_receta_shaddai,
+        vd.id_detalle_receta_shaddai,
+        il.lote,
+        il.fecha_caducidad,
         p.codigo_barras,
         p.nombre AS producto,
         vd.cantidad,
@@ -1129,6 +1525,7 @@ export const obtenerVenta = async (req, res) => {
         vd.subtotal
       FROM venta_detalle vd
       INNER JOIN productos p ON p.id_producto = vd.id_producto
+      LEFT JOIN inventario_lotes il ON il.id_lote = vd.id_lote
       LEFT JOIN ofertas_categorias oc ON oc.id_oferta = vd.id_oferta
       WHERE vd.id_venta = $1
       ORDER BY vd.id_detalle ASC

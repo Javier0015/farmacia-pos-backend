@@ -1,0 +1,755 @@
+import { pool } from '../config/db.js';
+
+const normalizarTexto = (valor) => {
+  if (valor === undefined || valor === null) return null;
+
+  const limpio = String(valor).trim();
+
+  return limpio || null;
+};
+
+const MAX_POSTGRES_INTEGER = 2147483647;
+
+const normalizarIdEntero = (valor) => {
+  if (valor === undefined || valor === null || valor === '') return null;
+
+  if (typeof valor === 'string' && valor.startsWith('tmp-')) {
+    return null;
+  }
+
+  const numero = Number(valor);
+
+  if (!Number.isInteger(numero)) return null;
+  if (numero <= 0) return null;
+  if (numero > MAX_POSTGRES_INTEGER) return null;
+
+  return numero;
+};
+
+const normalizarNumero = (valor) => {
+  if (valor === undefined || valor === null || valor === '') return null;
+
+  const numero = Number(valor);
+
+  return Number.isNaN(numero) ? null : numero;
+};
+
+const calcularIMC = (pesoKg, tallaCm) => {
+  const peso = normalizarNumero(pesoKg);
+  const talla = normalizarNumero(tallaCm);
+
+  if (!peso || !talla) return null;
+
+  const tallaMetros = talla / 100;
+
+  if (tallaMetros <= 0) return null;
+
+  return Number((peso / (tallaMetros * tallaMetros)).toFixed(2));
+};
+
+const registrarDocumentoClinico = async (
+  client,
+  {
+    id_expediente,
+    id_fila = null,
+    id_doctor,
+    id_sucursal = null,
+    tipo_documento,
+    id_origen,
+    folio = null,
+    titulo = null,
+    descripcion = null,
+    estatus = 'GENERADO',
+    tabla_origen,
+    ruta_frontend = null,
+    metadata = {},
+  }
+) => {
+  if (!id_expediente || !id_doctor || !tipo_documento || !id_origen) {
+    return null;
+  }
+
+  const resultado = await client.query(
+    `
+    INSERT INTO documentos_clinicos (
+      id_expediente,
+      id_fila,
+      id_doctor,
+      id_sucursal,
+      tipo_documento,
+      id_origen,
+      folio,
+      titulo,
+      descripcion,
+      estatus,
+      tabla_origen,
+      ruta_frontend,
+      metadata,
+      fecha_documento
+    )
+    VALUES (
+      $1, $2, $3, $4,
+      $5, $6, $7, $8, $9,
+      $10, $11, $12, $13::jsonb,
+      CURRENT_TIMESTAMP
+    )
+    RETURNING *;
+    `,
+    [
+      id_expediente,
+      id_fila,
+      id_doctor,
+      id_sucursal,
+      tipo_documento,
+      id_origen,
+      folio,
+      titulo,
+      descripcion,
+      estatus,
+      tabla_origen,
+      ruta_frontend,
+      JSON.stringify(metadata || {}),
+    ]
+  );
+
+  return resultado.rows[0];
+};
+
+export const crearNotaMedica = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      id_expediente,
+      id_fila,
+      id_sucursal,
+
+      antecedentes_padecimiento_actual,
+      exploracion_fisica,
+      plan,
+      pronostico,
+      pasa_a,
+      observaciones,
+
+      motivo_consulta,
+      diagnostico,
+
+      peso_kg,
+      talla_cm,
+      imc,
+      presion_arterial,
+      frecuencia_cardiaca,
+      temperatura,
+      saturacion_oxigeno,
+    } = req.body;
+
+    const idDoctor = req.usuario?.id_usuario;
+
+    if (!idDoctor) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: 'Usuario no autenticado.',
+      });
+    }
+
+    const idExpedienteFinal = normalizarIdEntero(id_expediente);
+    const idFilaFinal = normalizarIdEntero(id_fila);
+    const idSucursalBodyFinal = normalizarIdEntero(id_sucursal);
+
+    if (!idExpedienteFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El id_expediente es obligatorio.',
+      });
+    }
+
+    if (!normalizarTexto(antecedentes_padecimiento_actual)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Los antecedentes y padecimiento actual son obligatorios.',
+      });
+    }
+
+    if (!normalizarTexto(exploracion_fisica)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La exploración física es obligatoria.',
+      });
+    }
+
+    if (!normalizarTexto(plan)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El plan es obligatorio.',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const expedienteResult = await client.query(
+      `
+      SELECT 
+        id_expediente,
+        nombre_paciente,
+        primer_apellido,
+        segundo_apellido,
+        activo
+      FROM expedientes_clinicos
+      WHERE id_expediente = $1
+      LIMIT 1;
+      `,
+      [idExpedienteFinal]
+    );
+
+    if (expedienteResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'El expediente clínico no existe.',
+      });
+    }
+
+    if (expedienteResult.rows[0].activo === false) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El expediente clínico está inactivo.',
+      });
+    }
+
+    let idSucursalFinal =
+      idSucursalBodyFinal ||
+      normalizarIdEntero(req.usuario?.id_sucursal) ||
+      null;
+
+    if (idFilaFinal) {
+      const filaResult = await client.query(
+        `
+        SELECT 
+          id_fila,
+          id_expediente,
+          id_sucursal,
+          estatus
+        FROM doctor_fila_espera
+        WHERE id_fila = $1
+        LIMIT 1;
+        `,
+        [idFilaFinal]
+      );
+
+      if (filaResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'El registro de atención en fila no existe.',
+        });
+      }
+
+      const fila = filaResult.rows[0];
+
+      if (
+        fila.id_expediente &&
+        Number(fila.id_expediente) !== Number(idExpedienteFinal)
+      ) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'El expediente enviado no coincide con el expediente vinculado a la atención.',
+        });
+      }
+
+      idSucursalFinal = normalizarIdEntero(fila.id_sucursal) || idSucursalFinal;
+
+      if (fila.estatus !== 'EN_ATENCION') {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'La nota médica solo puede registrarse cuando la atención está en estado EN_ATENCION.',
+        });
+      }
+
+      const notaExistente = await client.query(
+        `
+        SELECT id_nota
+        FROM notas_medicas
+        WHERE id_fila = $1
+          AND activo = true
+        LIMIT 1;
+        `,
+        [idFilaFinal]
+      );
+
+      if (notaExistente.rows.length > 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(409).json({
+          ok: false,
+          mensaje: 'Esta atención ya tiene una nota médica registrada.',
+          id_nota: notaExistente.rows[0].id_nota,
+        });
+      }
+    }
+
+    const imcFinal = normalizarNumero(imc) || calcularIMC(peso_kg, talla_cm);
+
+    const queryInsert = `
+      INSERT INTO notas_medicas (
+        id_expediente,
+        id_fila,
+        id_doctor,
+        id_sucursal,
+
+        antecedentes_padecimiento_actual,
+        exploracion_fisica,
+        plan,
+        pronostico,
+        pasa_a,
+        observaciones,
+
+        motivo_consulta,
+        diagnostico,
+
+        peso_kg,
+        talla_cm,
+        imc,
+        presion_arterial,
+        frecuencia_cardiaca,
+        temperatura,
+        saturacion_oxigeno
+      )
+      VALUES (
+        $1, $2, $3, $4,
+        $5, $6, $7, $8, $9, $10,
+        $11, $12,
+        $13, $14, $15, $16, $17, $18, $19
+      )
+      RETURNING *;
+    `;
+
+    const valuesInsert = [
+      idExpedienteFinal,
+      idFilaFinal,
+      Number(idDoctor),
+      idSucursalFinal,
+
+      normalizarTexto(antecedentes_padecimiento_actual),
+      normalizarTexto(exploracion_fisica),
+      normalizarTexto(plan),
+      normalizarTexto(pronostico),
+      normalizarTexto(pasa_a),
+      normalizarTexto(observaciones),
+
+      normalizarTexto(motivo_consulta),
+      normalizarTexto(diagnostico),
+
+      normalizarNumero(peso_kg),
+      normalizarNumero(talla_cm),
+      imcFinal,
+      normalizarTexto(presion_arterial),
+      normalizarNumero(frecuencia_cardiaca),
+      normalizarNumero(temperatura),
+      normalizarNumero(saturacion_oxigeno),
+    ];
+
+    const notaResult = await client.query(queryInsert, valuesInsert);
+    const nota = notaResult.rows[0];
+
+    const documentoClinico = await registrarDocumentoClinico(client, {
+      id_expediente: idExpedienteFinal,
+      id_fila: idFilaFinal,
+      id_doctor: Number(idDoctor),
+      id_sucursal: idSucursalFinal,
+
+      tipo_documento: 'NOTA_MEDICA',
+      id_origen: nota.id_nota,
+      folio: `NOTA-${nota.id_nota}`,
+      titulo: 'Nota médica',
+      descripcion:
+        normalizarTexto(diagnostico) ||
+        normalizarTexto(motivo_consulta) ||
+        normalizarTexto(antecedentes_padecimiento_actual),
+      estatus: 'GENERADA',
+
+      tabla_origen: 'notas_medicas',
+      ruta_frontend: `/app/doctor-shaddai/recetas?id_expediente=${idExpedienteFinal}&id_fila=${
+        idFilaFinal || ''
+      }&tipo_atencion=CONSULTA_MEDICA`,
+
+      metadata: {
+        motivo_consulta: nota.motivo_consulta,
+        diagnostico: nota.diagnostico,
+        pronostico: nota.pronostico,
+        pasa_a: nota.pasa_a,
+        peso_kg: nota.peso_kg,
+        talla_cm: nota.talla_cm,
+        imc: nota.imc,
+        presion_arterial: nota.presion_arterial,
+        frecuencia_cardiaca: nota.frecuencia_cardiaca,
+        temperatura: nota.temperatura,
+        saturacion_oxigeno: nota.saturacion_oxigeno,
+      },
+    });
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Nota médica registrada correctamente.',
+      nota,
+      expediente: expedienteResult.rows[0],
+      documento_clinico: documentoClinico,
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error al hacer ROLLBACK:', rollbackError);
+    }
+
+    console.error('Error al crear nota médica:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al registrar la nota médica.',
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+};
+
+export const obtenerNotaPorFila = async (req, res) => {
+  try {
+    const { idFila } = req.params;
+    const idFilaFinal = normalizarIdEntero(idFila);
+
+    if (!idFilaFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El idFila es obligatorio.',
+      });
+    }
+
+    const query = `
+      SELECT
+        nm.*,
+        ec.nombre_paciente,
+        ec.primer_apellido,
+        ec.segundo_apellido,
+        ec.curp,
+        ec.telefono,
+        ec.sexo,
+        ec.edad,
+        ec.fecha_nacimiento,
+        ec.direccion,
+        ec.alergias,
+        ec.enfermedades_condiciones,
+        ec.medicamentos_actuales,
+        u.nombre AS doctor_usuario,
+        dsp.nombre_completo AS doctor_nombre_completo,
+        dsp.cedula_profesional,
+        dsp.especialidad,
+        s.nombre AS sucursal_nombre
+      FROM notas_medicas nm
+      INNER JOIN expedientes_clinicos ec ON ec.id_expediente = nm.id_expediente
+      LEFT JOIN usuarios u ON u.id_usuario = nm.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_usuario = nm.id_doctor
+      LEFT JOIN sucursales s ON s.id_sucursal = nm.id_sucursal
+      WHERE nm.id_fila = $1
+        AND nm.activo = true
+      ORDER BY nm.fecha_nota DESC
+      LIMIT 1;
+    `;
+
+    const { rows } = await pool.query(query, [idFilaFinal]);
+
+    return res.json({
+      ok: true,
+      existe: rows.length > 0,
+      nota: rows[0] || null,
+    });
+  } catch (error) {
+    console.error('Error al obtener nota médica por fila:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al obtener la nota médica de la atención.',
+      error: error.message,
+    });
+  }
+};
+
+export const listarNotasPorExpediente = async (req, res) => {
+  try {
+    const { idExpediente } = req.params;
+    const idExpedienteFinal = normalizarIdEntero(idExpediente);
+
+    if (!idExpedienteFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El idExpediente es obligatorio.',
+      });
+    }
+
+    const query = `
+      SELECT
+        nm.*,
+        u.nombre AS doctor_usuario,
+        dsp.nombre_completo AS doctor_nombre_completo,
+        dsp.cedula_profesional,
+        dsp.especialidad,
+        s.nombre AS sucursal_nombre
+      FROM notas_medicas nm
+      LEFT JOIN usuarios u ON u.id_usuario = nm.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_usuario = nm.id_doctor
+      LEFT JOIN sucursales s ON s.id_sucursal = nm.id_sucursal
+      WHERE nm.id_expediente = $1
+        AND nm.activo = true
+      ORDER BY nm.fecha_nota DESC;
+    `;
+
+    const { rows } = await pool.query(query, [idExpedienteFinal]);
+
+    return res.json({
+      ok: true,
+      notas: rows,
+    });
+  } catch (error) {
+    console.error('Error al listar notas médicas:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al listar las notas médicas del expediente.',
+      error: error.message,
+    });
+  }
+};
+
+export const obtenerNotaMedicaPorId = async (req, res) => {
+  try {
+    const { idNota } = req.params;
+    const idNotaFinal = normalizarIdEntero(idNota);
+
+    if (!idNotaFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El idNota es obligatorio.',
+      });
+    }
+
+    const query = `
+      SELECT
+        nm.*,
+        ec.nombre_paciente,
+        ec.primer_apellido,
+        ec.segundo_apellido,
+        ec.curp,
+        ec.telefono,
+        ec.sexo,
+        ec.edad,
+        ec.fecha_nacimiento,
+        ec.direccion,
+        ec.alergias,
+        ec.enfermedades_condiciones,
+        ec.medicamentos_actuales,
+        u.nombre AS doctor_usuario,
+        dsp.nombre_completo AS doctor_nombre_completo,
+        dsp.cedula_profesional,
+        dsp.especialidad,
+        s.nombre AS sucursal_nombre
+      FROM notas_medicas nm
+      INNER JOIN expedientes_clinicos ec ON ec.id_expediente = nm.id_expediente
+      LEFT JOIN usuarios u ON u.id_usuario = nm.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_usuario = nm.id_doctor
+      LEFT JOIN sucursales s ON s.id_sucursal = nm.id_sucursal
+      WHERE nm.id_nota = $1
+        AND nm.activo = true
+      LIMIT 1;
+    `;
+
+    const { rows } = await pool.query(query, [idNotaFinal]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'La nota médica no existe o está inactiva.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      nota: rows[0],
+    });
+  } catch (error) {
+    console.error('Error al obtener nota médica:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al obtener la nota médica.',
+      error: error.message,
+    });
+  }
+};
+
+export const actualizarNotaMedica = async (req, res) => {
+  try {
+    const { idNota } = req.params;
+    const idNotaFinal = normalizarIdEntero(idNota);
+
+    const {
+      antecedentes_padecimiento_actual,
+      exploracion_fisica,
+      plan,
+      pronostico,
+      pasa_a,
+      observaciones,
+
+      motivo_consulta,
+      diagnostico,
+
+      peso_kg,
+      talla_cm,
+      imc,
+      presion_arterial,
+      frecuencia_cardiaca,
+      temperatura,
+      saturacion_oxigeno,
+    } = req.body;
+
+    if (!idNotaFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El idNota es obligatorio.',
+      });
+    }
+
+    const imcFinal = normalizarNumero(imc) || calcularIMC(peso_kg, talla_cm);
+
+    const query = `
+      UPDATE notas_medicas
+      SET
+        antecedentes_padecimiento_actual = $1,
+        exploracion_fisica = $2,
+        plan = $3,
+        pronostico = $4,
+        pasa_a = $5,
+        observaciones = $6,
+
+        motivo_consulta = $7,
+        diagnostico = $8,
+
+        peso_kg = $9,
+        talla_cm = $10,
+        imc = $11,
+        presion_arterial = $12,
+        frecuencia_cardiaca = $13,
+        temperatura = $14,
+        saturacion_oxigeno = $15,
+
+        fecha_actualizacion = NOW()
+      WHERE id_nota = $16
+        AND activo = true
+      RETURNING *;
+    `;
+
+    const values = [
+      normalizarTexto(antecedentes_padecimiento_actual),
+      normalizarTexto(exploracion_fisica),
+      normalizarTexto(plan),
+      normalizarTexto(pronostico),
+      normalizarTexto(pasa_a),
+      normalizarTexto(observaciones),
+
+      normalizarTexto(motivo_consulta),
+      normalizarTexto(diagnostico),
+
+      normalizarNumero(peso_kg),
+      normalizarNumero(talla_cm),
+      imcFinal,
+      normalizarTexto(presion_arterial),
+      normalizarNumero(frecuencia_cardiaca),
+      normalizarNumero(temperatura),
+      normalizarNumero(saturacion_oxigeno),
+
+      idNotaFinal,
+    ];
+
+    const { rows } = await pool.query(query, values);
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'La nota médica no existe o está inactiva.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Nota médica actualizada correctamente.',
+      nota: rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar nota médica:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al actualizar la nota médica.',
+      error: error.message,
+    });
+  }
+};
+
+export const eliminarNotaMedica = async (req, res) => {
+  try {
+    const { idNota } = req.params;
+    const idNotaFinal = normalizarIdEntero(idNota);
+
+    if (!idNotaFinal) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El idNota es obligatorio.',
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      UPDATE notas_medicas
+      SET 
+        activo = false,
+        fecha_actualizacion = NOW()
+      WHERE id_nota = $1
+        AND activo = true
+      RETURNING *;
+      `,
+      [idNotaFinal]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'La nota médica no existe o ya estaba inactiva.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Nota médica eliminada correctamente.',
+      nota: rows[0],
+    });
+  } catch (error) {
+    console.error('Error al eliminar nota médica:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al eliminar la nota médica.',
+      error: error.message,
+    });
+  }
+};

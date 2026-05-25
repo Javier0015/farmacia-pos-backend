@@ -1097,16 +1097,33 @@ export const bajaLotePorCaducidad = async (req, res) => {
 
 export const consultarStockSucursales = async (req, res) => {
   try {
-    const { buscar } = req.query;
+    const {
+      buscar = '',
+      busqueda = '',
+      nombre = '',
+      codigo_barras = '',
+      codigo = '',
+      presentacion = '',
+    } = req.query;
 
-    if (!buscar || !buscar.trim()) {
+    const textoBusqueda = String(
+      buscar ||
+        busqueda ||
+        nombre ||
+        codigo_barras ||
+        codigo ||
+        presentacion ||
+        ''
+    ).trim();
+
+    if (!textoBusqueda) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'Debes escribir el nombre, código de barras o presentación del producto',
+        mensaje:
+          'Debes escribir el nombre, código de barras o presentación del producto',
       });
     }
 
-    const textoBusqueda = buscar.trim();
     const texto = `%${textoBusqueda}%`;
 
     const productoResultado = await pool.query(
@@ -1121,17 +1138,23 @@ export const consultarStockSucursales = async (req, res) => {
         c.nombre AS categoria,
         p.precio_venta
       FROM productos p
-      LEFT JOIN categorias c ON c.id_categoria = p.id_categoria
+      LEFT JOIN categorias c 
+        ON c.id_categoria = p.id_categoria
       WHERE 
-        p.nombre ILIKE $1
-        OR p.codigo_barras ILIKE $1
-        OR p.laboratorio ILIKE $1
-        OR p.presentacion ILIKE $1
+        p.activo = true
+        AND (
+          p.nombre ILIKE $1
+          OR p.codigo_barras ILIKE $1
+          OR p.laboratorio ILIKE $1
+          OR p.presentacion ILIKE $1
+        )
       ORDER BY 
         CASE 
           WHEN p.codigo_barras = $2 THEN 1
           WHEN p.nombre ILIKE $1 THEN 2
-          ELSE 3
+          WHEN p.presentacion ILIKE $1 THEN 3
+          WHEN p.laboratorio ILIKE $1 THEN 4
+          ELSE 5
         END,
         p.nombre ASC
       LIMIT 1
@@ -1175,6 +1198,35 @@ export const consultarStockSucursales = async (req, res) => {
       [producto.id_producto]
     );
 
+    const sucursales = sucursalesResultado.rows;
+
+    const productos = sucursales.map((sucursal) => ({
+      id_producto: producto.id_producto,
+      codigo_barras: producto.codigo_barras,
+      nombre_producto: producto.nombre,
+      nombre: producto.nombre,
+      descripcion: producto.descripcion,
+      laboratorio: producto.laboratorio,
+      presentacion: producto.presentacion,
+      categoria: producto.categoria,
+      precio_venta: producto.precio_venta,
+
+      id_sucursal: sucursal.id_sucursal,
+      nombre_sucursal: sucursal.sucursal,
+      sucursal: sucursal.sucursal,
+      direccion_sucursal: sucursal.direccion,
+
+      stock_disponible: Number(sucursal.stock || 0),
+      stock: Number(sucursal.stock || 0),
+      stock_minimo: Number(sucursal.stock_minimo || 0),
+      ubicacion: sucursal.ubicacion,
+      estado: sucursal.estado,
+      fecha_actualizacion: sucursal.fecha_actualizacion,
+
+      lote: null,
+      fecha_caducidad: null,
+    }));
+
     return res.json({
       ok: true,
       producto: {
@@ -1187,7 +1239,8 @@ export const consultarStockSucursales = async (req, res) => {
         categoria: producto.categoria,
         precio_venta: producto.precio_venta,
       },
-      sucursales: sucursalesResultado.rows,
+      sucursales,
+      productos,
     });
   } catch (error) {
     console.error('Error al consultar stock en sucursales:', error);
@@ -1195,6 +1248,7 @@ export const consultarStockSucursales = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al consultar stock en sucursales',
+      error: error.message,
     });
   }
 };
