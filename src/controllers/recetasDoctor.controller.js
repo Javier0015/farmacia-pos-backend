@@ -468,22 +468,17 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
       });
     }
 
-    /**
-     * Validación de permisos:
-     *
-     * - ATENDIDA / RECHAZADA / CANCELADA:
-     *   Las puede usar el usuario validador de recetas.
-     *
-     * - PENDIENTE_CAJERO / SURTIDA / SURTIDA_PARCIAL:
-     *   Las puede usar el cajero desde el POS.
-     *
-     * Ajusta los roles según como los tengas en tu sistema.
-     */
-    const esEstatusDeValidacion = ['ATENDIDA', 'RECHAZADA', 'CANCELADA'].includes(estatusFinal);
+    const esEstatusDeValidacion = [
+      'ATENDIDA',
+      'RECHAZADA',
+      'CANCELADA',
+    ].includes(estatusFinal);
 
-    const esEstatusDeCajero = ['PENDIENTE_CAJERO', 'SURTIDA', 'SURTIDA_PARCIAL'].includes(
-      estatusFinal
-    );
+    const esEstatusDeCajero = [
+      'PENDIENTE_CAJERO',
+      'SURTIDA',
+      'SURTIDA_PARCIAL',
+    ].includes(estatusFinal);
 
     const rolUsuario = String(req.usuario?.rol || '').toUpperCase();
 
@@ -551,24 +546,8 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
       });
     }
 
-    /**
-     * Reglas de transición:
-     *
-     * PENDIENTE:
-     * - Puede pasar a ATENDIDA, RECHAZADA, CANCELADA o PENDIENTE_CAJERO.
-     *
-     * ATENDIDA:
-     * - Puede pasar a PENDIENTE_CAJERO.
-     *
-     * PENDIENTE_CAJERO:
-     * - Puede pasar a SURTIDA o SURTIDA_PARCIAL.
-     *
-     * SURTIDA_PARCIAL:
-     * - Puede seguir como SURTIDA_PARCIAL o pasar a SURTIDA.
-     *
-     * SURTIDA:
-     * - Ya no debería modificarse.
-     */
+    const estatusActual = String(receta.estatus || '').toUpperCase();
+
     const transicionesPermitidas = {
       PENDIENTE: ['ATENDIDA', 'RECHAZADA', 'CANCELADA', 'PENDIENTE_CAJERO'],
       ATENDIDA: ['PENDIENTE_CAJERO'],
@@ -578,8 +557,6 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
       RECHAZADA: [],
       CANCELADA: [],
     };
-
-    const estatusActual = String(receta.estatus || '').toUpperCase();
 
     const puedeCambiar =
       transicionesPermitidas[estatusActual] &&
@@ -594,14 +571,14 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
       });
     }
 
-    /**
-     * Los puntos del doctor solo se generan cuando la receta pasa a ATENDIDA.
-     * No se vuelven a generar cuando el cajero la marca como SURTIDA o SURTIDA_PARCIAL.
-     */
+    const yaEstabaAtendida = estatusActual === 'ATENDIDA';
+    const seEstaAtendiendo = estatusFinal === 'ATENDIDA';
+    const debeGenerarPuntos = seEstaAtendiendo && !yaEstabaAtendida;
+
     let configuracionDoctor = null;
     let puntosPorReceta = 0;
 
-    if (estatusFinal === 'ATENDIDA') {
+    if (debeGenerarPuntos) {
       configuracionDoctor = await obtenerConfiguracionPuntosDoctor(client);
 
       puntosPorReceta = esValorActivo(configuracionDoctor.puntos_doctor_activo)
@@ -622,7 +599,7 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
       `
       UPDATE doctores_recetas
       SET
-        estatus = $1,
+        estatus = $1::varchar,
         id_usuario_validador = CASE
           WHEN $2::boolean = true THEN $3
           ELSE id_usuario_validador
@@ -632,11 +609,11 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
           ELSE fecha_validacion
         END,
         observaciones_validacion = CASE
-          WHEN $2::boolean = true THEN $4
+          WHEN $2::boolean = true THEN $4::text
           ELSE observaciones_validacion
         END,
         puntos_generados = CASE
-          WHEN $1 = 'ATENDIDA' THEN $5
+          WHEN $7::boolean = true THEN $5::numeric
           ELSE puntos_generados
         END,
         fecha_actualizacion = CURRENT_TIMESTAMP
@@ -650,19 +627,20 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
         observaciones ? observaciones.trim() : null,
         puntosPorReceta,
         id_receta,
+        debeGenerarPuntos,
       ]
     );
 
     let puntos = await obtenerPuntosDoctor(client, receta.id_doctor);
     let movimiento = null;
 
-    if (estatusFinal === 'ATENDIDA' && puntosPorReceta > 0) {
+    if (debeGenerarPuntos && puntosPorReceta > 0) {
       await client.query(
         `
         UPDATE doctores_perfiles
         SET
-          puntos_actuales = COALESCE(puntos_actuales, 0) + $1,
-          puntos_acumulados = COALESCE(puntos_acumulados, 0) + $1,
+          puntos_actuales = COALESCE(puntos_actuales, 0) + $1::numeric,
+          puntos_acumulados = COALESCE(puntos_acumulados, 0) + $1::numeric,
           fecha_actualizacion = CURRENT_TIMESTAMP
         WHERE id_doctor = $2
         `,
@@ -679,7 +657,7 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
           puntos,
           descripcion
         )
-        VALUES ($1, $2, $3, 'RECETA_ATENDIDA', $4, $5)
+        VALUES ($1, $2, $3, 'RECETA_ATENDIDA', $4::numeric, $5::text)
         RETURNING *
         `,
         [
@@ -700,10 +678,22 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
     let mensaje = `Receta marcada como ${estatusFinal}`;
 
     if (estatusFinal === 'ATENDIDA') {
-      mensaje =
-        puntosPorReceta > 0
-          ? 'Receta atendida correctamente. Se generaron puntos al doctor.'
-          : 'Receta atendida correctamente. No se generaron puntos porque la regla está en 0 o inactiva.';
+      if (debeGenerarPuntos) {
+        mensaje =
+          puntosPorReceta > 0
+            ? 'Receta atendida correctamente. Se generaron puntos al doctor.'
+            : 'Receta atendida correctamente. No se generaron puntos porque la regla está en 0 o inactiva.';
+      } else {
+        mensaje = 'La receta ya estaba atendida. No se generaron puntos nuevamente.';
+      }
+    }
+
+    if (estatusFinal === 'RECHAZADA') {
+      mensaje = 'Receta rechazada correctamente.';
+    }
+
+    if (estatusFinal === 'CANCELADA') {
+      mensaje = 'Receta cancelada correctamente.';
     }
 
     if (estatusFinal === 'PENDIENTE_CAJERO') {
@@ -735,11 +725,34 @@ export const actualizarEstatusRecetaDoctor = async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
 
-    console.error('Error al actualizar estatus de receta:', error);
+    console.error('==============================');
+    console.error('ERROR AL ACTUALIZAR ESTATUS DE RECETA');
+    console.error('Mensaje:', error.message);
+    console.error('Código:', error.code);
+    console.error('Detalle:', error.detail);
+    console.error('Tabla:', error.table);
+    console.error('Columna:', error.column);
+    console.error('Constraint:', error.constraint);
+    console.error('Stack:', error.stack);
+    console.error('Body recibido:', req.body);
+    console.error('Params recibidos:', req.params);
+    console.error('Usuario:', req.usuario);
+    console.error('==============================');
 
     return res.status(500).json({
       ok: false,
       mensaje: 'Error interno al actualizar estatus de receta',
+      error:
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : {
+              message: error.message,
+              code: error.code,
+              detail: error.detail,
+              table: error.table,
+              column: error.column,
+              constraint: error.constraint,
+            },
     });
   } finally {
     client.release();

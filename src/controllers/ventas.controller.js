@@ -14,12 +14,108 @@ const generarFolioVenta = () => {
   return `V-${yyyy}${mm}${dd}-${hh}${mi}${ss}-${random}`;
 };
 
+const generarFolioDevolucion = () => {
+  const fecha = new Date();
+
+  const yyyy = fecha.getFullYear();
+  const mm = String(fecha.getMonth() + 1).padStart(2, '0');
+  const dd = String(fecha.getDate()).padStart(2, '0');
+  const hh = String(fecha.getHours()).padStart(2, '0');
+  const mi = String(fecha.getMinutes()).padStart(2, '0');
+  const ss = String(fecha.getSeconds()).padStart(2, '0');
+  const random = Math.floor(Math.random() * 9000) + 1000;
+
+  return `DEV-${yyyy}${mm}${dd}-${hh}${mi}${ss}-${random}`;
+};
+
+const estadosVentaConDevolucionPermitida = [
+  'COMPLETADA',
+  'DEVUELTA_PARCIAL',
+];
+
 const redondearDos = (valor) => {
   return Number(Number(valor || 0).toFixed(2));
 };
 
 const esValorActivo = (valor) => {
   return valor === true || valor === 'true' || valor === 1 || valor === '1';
+};
+
+
+const METODOS_PAGO_PERMITIDOS = [
+  'EFECTIVO',
+  'TARJETA',
+  'TRANSFERENCIA',
+  'PUNTOS',
+  'MIXTO',
+];
+
+const METODOS_PAGO_DETALLE_PERMITIDOS = [
+  'EFECTIVO',
+  'TARJETA',
+  'TRANSFERENCIA',
+  'PUNTOS',
+];
+
+const normalizarPagosMixtos = (pagos = []) => {
+  const acumulado = {
+    EFECTIVO: 0,
+    TARJETA: 0,
+    TRANSFERENCIA: 0,
+    PUNTOS: 0,
+  };
+
+  if (!Array.isArray(pagos)) {
+    return {
+      ok: false,
+      mensaje: 'Los pagos de una venta mixta deben enviarse como arreglo',
+      pagos: [],
+      acumulado,
+    };
+  }
+
+  for (const pago of pagos) {
+    const metodo = String(pago?.metodo_pago || '').trim().toUpperCase();
+    const monto = redondearDos(pago?.monto || 0);
+
+    if (!metodo) continue;
+
+    if (!METODOS_PAGO_DETALLE_PERMITIDOS.includes(metodo)) {
+      return {
+        ok: false,
+        mensaje: `Método de pago mixto no válido: ${metodo}`,
+        pagos: [],
+        acumulado,
+      };
+    }
+
+    if (monto < 0) {
+      return {
+        ok: false,
+        mensaje: 'Los montos de pago no pueden ser negativos',
+        pagos: [],
+        acumulado,
+      };
+    }
+
+    if (monto > 0) {
+      acumulado[metodo] = redondearDos(acumulado[metodo] + monto);
+    }
+  }
+
+  const pagosNormalizados = Object.entries(acumulado)
+    .filter(([, monto]) => Number(monto || 0) > 0)
+    .map(([metodo_pago, monto]) => ({
+      metodo_pago,
+      monto: redondearDos(monto),
+    }));
+
+  return {
+    ok: true,
+    mensaje: null,
+    pagos: pagosNormalizados,
+    acumulado,
+  };
 };
 
 const descontarLotesFEFO = async ({
@@ -354,6 +450,7 @@ export const crearVenta = async (req, res) => {
       id_sesion,
       metodo_pago,
       monto_recibido,
+      pagos = [],
       descuento = 0,
       impuesto = 0,
       productos,
@@ -378,14 +475,7 @@ export const crearVenta = async (req, res) => {
 
     const metodoPagoFinal = String(metodo_pago || 'EFECTIVO').toUpperCase();
 
-    const metodosPermitidos = [
-      'EFECTIVO',
-      'TARJETA',
-      'TRANSFERENCIA',
-      'PUNTOS',
-    ];
-
-    if (!metodosPermitidos.includes(metodoPagoFinal)) {
+    if (!METODOS_PAGO_PERMITIDOS.includes(metodoPagoFinal)) {
       return res.status(400).json({
         ok: false,
         mensaje: 'Método de pago no válido',
@@ -538,8 +628,6 @@ export const crearVenta = async (req, res) => {
 
       doctorShaddaiVenta = doctorResultado.rows[0];
 
-      // Normalizamos el valor para que ventas.id_doctor guarde siempre id_perfil,
-      // aunque recetas_shaddai.id_doctor venga como id_usuario.
       idDoctorVenta = Number(doctorShaddaiVenta.id_perfil);
 
       if (!esValorActivo(doctorShaddaiVenta.activo)) {
@@ -588,6 +676,7 @@ export const crearVenta = async (req, res) => {
           activo
         FROM productos
         WHERE id_producto = $1
+          AND activo = true
         `,
         [id_producto]
       );
@@ -597,20 +686,11 @@ export const crearVenta = async (req, res) => {
 
         return res.status(404).json({
           ok: false,
-          mensaje: `Producto no encontrado: ${id_producto}`,
+          mensaje: `Producto no encontrado o desactivado: ${id_producto}`,
         });
       }
 
       const producto = productoResultado.rows[0];
-
-      if (!producto.activo) {
-        await client.query('ROLLBACK');
-
-        return res.status(400).json({
-          ok: false,
-          mensaje: `El producto ${producto.nombre} está desactivado`,
-        });
-      }
 
       const inventarioResultado = await client.query(
         `
@@ -656,15 +736,15 @@ export const crearVenta = async (req, res) => {
 
       const precioOriginal =
         item.precio_original !== undefined &&
-        item.precio_original !== null &&
-        item.precio_original !== ''
+          item.precio_original !== null &&
+          item.precio_original !== ''
           ? redondearDos(item.precio_original)
           : precioBaseDB;
 
       let precioUnitario =
         item.precio_unitario !== undefined &&
-        item.precio_unitario !== null &&
-        item.precio_unitario !== ''
+          item.precio_unitario !== null &&
+          item.precio_unitario !== ''
           ? redondearDos(item.precio_unitario)
           : precioBaseDB;
 
@@ -737,18 +817,18 @@ export const crearVenta = async (req, res) => {
 
       const resultadoLotes = idLoteSeleccionado
         ? await descontarLoteSeleccionado({
-            client,
-            id_sucursal,
-            id_producto,
-            id_lote: idLoteSeleccionado,
-            cantidadVenta,
-          })
+          client,
+          id_sucursal,
+          id_producto,
+          id_lote: idLoteSeleccionado,
+          cantidadVenta,
+        })
         : await descontarLotesFEFO({
-            client,
-            id_sucursal,
-            id_producto,
-            cantidadVenta,
-          });
+          client,
+          id_sucursal,
+          id_producto,
+          cantidadVenta,
+        });
 
       if (!resultadoLotes.ok) {
         await client.query('ROLLBACK');
@@ -839,12 +919,181 @@ export const crearVenta = async (req, res) => {
       });
     }
 
-    const puntosUsados = esPagoConPuntos ? totalVenta : 0;
-    const montoPagadoPuntos = esPagoConPuntos ? totalVenta : 0;
-    const montoPagadoDinero = esPagoConPuntos ? 0 : totalVenta;
+    const esPagoMixto = metodoPagoFinal === 'MIXTO';
+
+    let pagosVenta = [];
+    let puntosUsados = 0;
+    let montoPagadoPuntos = 0;
+    let montoPagadoDinero = 0;
+    let montoRecibidoFinal = 0;
+    let cambio = 0;
+
+    if (esPagoMixto) {
+      const pagosNormalizados = normalizarPagosMixtos(pagos);
+
+      if (!pagosNormalizados.ok) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: pagosNormalizados.mensaje,
+        });
+      }
+
+      if (pagosNormalizados.pagos.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'Debes capturar al menos un pago para una venta mixta',
+        });
+      }
+
+      const efectivoRecibido = redondearDos(pagosNormalizados.acumulado.EFECTIVO || 0);
+      const tarjetaPagada = redondearDos(pagosNormalizados.acumulado.TARJETA || 0);
+      const transferenciaPagada = redondearDos(pagosNormalizados.acumulado.TRANSFERENCIA || 0);
+      const puntosPagados = redondearDos(pagosNormalizados.acumulado.PUNTOS || 0);
+
+      const pagosNoEfectivo = redondearDos(
+        tarjetaPagada + transferenciaPagada + puntosPagados
+      );
+
+      if (pagosNoEfectivo - totalVenta > 0.02) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'Los pagos con tarjeta, transferencia o puntos no pueden exceder el total de la venta',
+          total: totalVenta,
+          pagos_no_efectivo: pagosNoEfectivo,
+        });
+      }
+
+      const pendienteAntesDeEfectivo = redondearDos(
+        Math.max(totalVenta - pagosNoEfectivo, 0)
+      );
+
+      const efectivoAplicado = redondearDos(
+        Math.min(efectivoRecibido, pendienteAntesDeEfectivo)
+      );
+
+      cambio = redondearDos(
+        Math.max(efectivoRecibido - pendienteAntesDeEfectivo, 0)
+      );
+
+      montoPagadoPuntos = puntosPagados;
+      puntosUsados = puntosPagados;
+      montoPagadoDinero = redondearDos(
+        efectivoAplicado + tarjetaPagada + transferenciaPagada
+      );
+
+      const totalCubierto = redondearDos(montoPagadoDinero + montoPagadoPuntos);
+
+      if (totalCubierto + 0.02 < totalVenta) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El total pagado no cubre el total de la venta',
+          total: totalVenta,
+          total_pagado: totalCubierto,
+          pendiente: redondearDos(totalVenta - totalCubierto),
+        });
+      }
+
+      montoRecibidoFinal = redondearDos(
+        efectivoRecibido + tarjetaPagada + transferenciaPagada + puntosPagados
+      );
+
+      pagosVenta = [
+        efectivoAplicado > 0
+          ? {
+            metodo_pago: 'EFECTIVO',
+            monto: efectivoAplicado,
+            referencia: null,
+            monto_recibido: efectivoRecibido,
+            cambio,
+          }
+          : null,
+        tarjetaPagada > 0
+          ? {
+            metodo_pago: 'TARJETA',
+            monto: tarjetaPagada,
+            referencia: null,
+          }
+          : null,
+        transferenciaPagada > 0
+          ? {
+            metodo_pago: 'TRANSFERENCIA',
+            monto: transferenciaPagada,
+            referencia: null,
+          }
+          : null,
+        puntosPagados > 0
+          ? {
+            metodo_pago: 'PUNTOS',
+            monto: puntosPagados,
+            referencia: tarjetaPuntos?.codigo_barras || null,
+          }
+          : null,
+      ].filter(Boolean);
+    } else {
+      if (esPagoConPuntos) {
+        puntosUsados = totalVenta;
+        montoPagadoPuntos = totalVenta;
+        montoPagadoDinero = 0;
+        montoRecibidoFinal = 0;
+        cambio = 0;
+      } else {
+        puntosUsados = 0;
+        montoPagadoPuntos = 0;
+        montoPagadoDinero = totalVenta;
+        montoRecibidoFinal = redondearDos(monto_recibido || 0);
+
+        if (metodoPagoFinal === 'EFECTIVO' && montoRecibidoFinal < totalVenta) {
+          await client.query('ROLLBACK');
+
+          return res.status(400).json({
+            ok: false,
+            mensaje: 'El monto recibido no cubre el total de la venta',
+            total: totalVenta,
+            monto_recibido: montoRecibidoFinal,
+          });
+        }
+
+        cambio =
+          metodoPagoFinal === 'EFECTIVO'
+            ? redondearDos(montoRecibidoFinal - totalVenta)
+            : 0;
+      }
+
+      pagosVenta = [
+        {
+          metodo_pago: metodoPagoFinal,
+          monto: totalVenta,
+          referencia:
+            metodoPagoFinal === 'PUNTOS'
+              ? tarjetaPuntos?.codigo_barras || null
+              : null,
+          monto_recibido:
+            metodoPagoFinal === 'EFECTIVO' ? montoRecibidoFinal : totalVenta,
+          cambio,
+        },
+      ];
+    }
+
+    if (puntosUsados > 0 && !tarjetaPuntos) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Para pagar con puntos debes vincular una tarjeta de puntos',
+      });
+    }
 
     if (
-      esPagoConPuntos &&
+      puntosUsados > 0 &&
       Number(tarjetaPuntos.puntos_actuales || 0) < puntosUsados
     ) {
       await client.query('ROLLBACK');
@@ -860,12 +1109,12 @@ export const crearVenta = async (req, res) => {
     const configuracionPuntos = await obtenerConfiguracionPuntos(client);
 
     puntosClienteGanados =
-      tarjetaPuntos && !esPagoConPuntos
+      tarjetaPuntos && montoPagadoDinero > 0
         ? calcularPuntosPorcentaje({
-            total: totalVenta,
-            porcentaje: configuracionPuntos.porcentaje_cliente,
-            activo: configuracionPuntos.puntos_cliente_activo,
-          })
+          total: montoPagadoDinero,
+          porcentaje: configuracionPuntos.porcentaje_cliente,
+          activo: configuracionPuntos.puntos_cliente_activo,
+        })
         : 0;
 
     puntosCajeroGanados = calcularPuntosPorcentaje({
@@ -874,61 +1123,41 @@ export const crearVenta = async (req, res) => {
       activo: configuracionPuntos.puntos_cajero_activo,
     });
 
-    const montoRecibidoFinal = esPagoConPuntos
-      ? 0
-      : redondearDos(monto_recibido || 0);
-
-    if (metodoPagoFinal === 'EFECTIVO' && montoRecibidoFinal < totalVenta) {
-      await client.query('ROLLBACK');
-
-      return res.status(400).json({
-        ok: false,
-        mensaje: 'El monto recibido no cubre el total de la venta',
-        total: totalVenta,
-        monto_recibido: montoRecibidoFinal,
-      });
-    }
-
-    const cambio =
-      metodoPagoFinal === 'EFECTIVO'
-        ? redondearDos(montoRecibidoFinal - totalVenta)
-        : 0;
-
     const folio = generarFolioVenta();
 
     const ventaResultado = await client.query(
       `
-      INSERT INTO ventas (
-        folio,
-        id_sucursal,
-        id_caja,
-        id_sesion,
-        id_usuario,
-        subtotal,
-        subtotal_sin_descuento,
-        descuento_ofertas,
-        descuento,
-        impuesto,
-        total,
-        metodo_pago,
-        monto_recibido,
-        cambio,
-        estado,
-        id_tarjeta_puntos,
-        puntos_ganados,
-        monto_pagado_dinero,
-        monto_pagado_puntos,
-        puntos_usados,
-        id_doctor
-      )
-      VALUES (
-        $1,$2,$3,$4,$5,
-        $6,$7,$8,$9,$10,
-        $11,$12,$13,$14,'COMPLETADA',
-        $15,$16,$17,$18,$19,$20
-      )
-      RETURNING *
-      `,
+  INSERT INTO ventas (
+    folio,
+    id_sucursal,
+    id_caja,
+    id_sesion,
+    id_usuario,
+    subtotal,
+    subtotal_sin_descuento,
+    descuento_ofertas,
+    descuento,
+    impuesto,
+    total,
+    metodo_pago,
+    monto_recibido,
+    cambio,
+    estado,
+    id_tarjeta_puntos,
+    puntos_ganados,
+    monto_pagado_dinero,
+    monto_pagado_puntos,
+    puntos_usados,
+    id_doctor
+  )
+  VALUES (
+    $1,$2,$3,$4,$5,
+    $6,$7,$8,$9,$10,
+    $11,$12,$13,$14,'COMPLETADA',
+    $15,$16,$17,$18,$19,$20
+  )
+  RETURNING *
+  `,
       [
         folio,
         id_sucursal,
@@ -954,6 +1183,26 @@ export const crearVenta = async (req, res) => {
     );
 
     const venta = ventaResultado.rows[0];
+
+    for (const pago of pagosVenta) {
+      await client.query(
+        `
+        INSERT INTO ventas_pagos (
+          id_venta,
+          metodo_pago,
+          monto,
+          referencia
+        )
+        VALUES ($1,$2,$3,$4)
+        `,
+        [
+          venta.id_venta,
+          pago.metodo_pago,
+          redondearDos(pago.monto),
+          pago.referencia || null,
+        ]
+      );
+    }
 
     if (doctorShaddaiVenta) {
       const porcentajeDoctor = Number(
@@ -1126,7 +1375,7 @@ export const crearVenta = async (req, res) => {
 
     let tarjetaActualizada = null;
 
-    if (esPagoConPuntos) {
+    if (puntosUsados > 0) {
       const puntosAnteriores = Number(tarjetaPuntos.puntos_actuales || 0);
       const puntosNuevos = redondearDos(puntosAnteriores - puntosUsados);
 
@@ -1178,7 +1427,7 @@ export const crearVenta = async (req, res) => {
       );
     }
 
-    if (!esPagoConPuntos && tarjetaPuntos && puntosClienteGanados > 0) {
+    if (tarjetaPuntos && puntosClienteGanados > 0) {
       const puntosAnteriores = Number(tarjetaPuntos.puntos_actuales || 0);
       const puntosNuevos = redondearDos(puntosAnteriores + puntosClienteGanados);
 
@@ -1255,38 +1504,40 @@ export const crearVenta = async (req, res) => {
       );
     }
 
-    const montoMovimientoCaja = metodoPagoFinal === 'EFECTIVO' ? totalVenta : 0;
+    const pagosConMovimientoCaja = pagosVenta.filter((pago) => {
+      return Number(pago.monto || 0) > 0;
+    });
 
-    await client.query(
-      `
-      INSERT INTO caja_movimientos (
-        id_sesion,
-        id_sucursal,
-        tipo_movimiento,
-        concepto,
-        monto,
-        metodo_pago,
-        referencia,
-        observaciones,
-        id_usuario
-      )
-      VALUES ($1,$2,'VENTA',$3,$4,$5,$6,$7,$8)
-      `,
-      [
-        id_sesion,
-        id_sucursal,
-        `Venta ${folio}`,
-        montoMovimientoCaja,
-        metodoPagoFinal,
-        folio,
-        tarjetaPuntos
-          ? esPagoConPuntos
-            ? `Venta pagada con puntos | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos usados: ${puntosUsados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`
-            : `Venta registrada desde POS | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos cliente: ${puntosClienteGanados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`
-          : `Venta registrada desde POS | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`,
-        req.usuario.id_usuario,
-      ]
-    );
+    for (const pagoCaja of pagosConMovimientoCaja) {
+      await client.query(
+        `
+    INSERT INTO caja_movimientos (
+      id_sesion,
+      id_sucursal,
+      tipo_movimiento,
+      concepto,
+      monto,
+      metodo_pago,
+      referencia,
+      observaciones,
+      id_usuario
+    )
+    VALUES ($1,$2,'VENTA',$3,$4,$5,$6,$7,$8)
+    `,
+        [
+          id_sesion,
+          id_sucursal,
+          `Venta ${folio}`,
+          redondearDos(pagoCaja.monto),
+          pagoCaja.metodo_pago,
+          folio,
+          tarjetaPuntos
+            ? `Venta registrada desde POS | Método ${pagoCaja.metodo_pago} | Tarjeta ${tarjetaPuntos.codigo_barras} | Puntos usados: ${puntosUsados} | Puntos cliente: ${puntosClienteGanados} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`
+            : `Venta registrada desde POS | Método ${pagoCaja.metodo_pago} | Descuento ofertas: ${descuentoOfertasVenta} | Puntos cajero: ${puntosCajeroGanados} | Puntos doctor Shaddai: ${puntosDoctorShaddaiGanados}`,
+          req.usuario.id_usuario,
+        ]
+      );
+    }
 
     await client.query('COMMIT');
 
@@ -1296,6 +1547,7 @@ export const crearVenta = async (req, res) => {
       venta: {
         ...venta,
         productos: productosProcesados,
+        pagos: pagosVenta,
         tarjeta_puntos: tarjetaActualizada,
         doctor_shaddai_puntos: doctorShaddaiPuntos,
         receta_shaddai_actualizada: recetaShaddaiActualizada,
@@ -1313,6 +1565,7 @@ export const crearVenta = async (req, res) => {
         monto_pagado_dinero: montoPagadoDinero,
         monto_pagado_puntos: montoPagadoPuntos,
         puntos_usados: puntosUsados,
+        pagos: pagosVenta,
         puntos_ganados: puntosClienteGanados,
         puntos_ganados_cliente: puntosClienteGanados,
         puntos_ganados_cajero: puntosCajeroGanados,
@@ -1339,6 +1592,112 @@ export const crearVenta = async (req, res) => {
     });
   } finally {
     client.release();
+  }
+};
+
+export const obtenerInfoDevolucionVenta = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const ventaResultado = await pool.query(
+      `
+      SELECT
+        v.id_venta,
+        v.folio,
+        v.id_sucursal,
+        s.nombre AS sucursal,
+        v.id_caja,
+        c.nombre AS caja,
+        v.id_sesion,
+        v.id_usuario,
+        u.nombre AS usuario,
+        v.subtotal,
+        v.descuento,
+        v.impuesto,
+        v.total,
+        v.metodo_pago,
+        v.monto_recibido,
+        v.cambio,
+        v.estado,
+        v.fecha_venta
+      FROM ventas v
+      INNER JOIN sucursales s ON s.id_sucursal = v.id_sucursal
+      INNER JOIN cajas c ON c.id_caja = v.id_caja
+      INNER JOIN usuarios u ON u.id_usuario = v.id_usuario
+      WHERE v.id_venta = $1
+      `,
+      [id]
+    );
+
+    if (ventaResultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Venta no encontrada',
+      });
+    }
+
+    const venta = ventaResultado.rows[0];
+
+    const detalleResultado = await pool.query(
+      `
+      SELECT
+        vd.id_detalle,
+        vd.id_venta,
+        vd.id_producto,
+        p.nombre AS producto,
+        p.codigo_barras,
+        vd.id_lote,
+        il.lote,
+        il.fecha_caducidad,
+        vd.cantidad,
+        vd.precio_unitario,
+        vd.descuento,
+        vd.subtotal,
+        COALESCE(dev.cantidad_devuelta, 0)::numeric(12,2) AS cantidad_devuelta,
+        (
+          COALESCE(vd.cantidad, 0) - COALESCE(dev.cantidad_devuelta, 0)
+        )::numeric(12,2) AS cantidad_disponible_devolver
+      FROM venta_detalle vd
+      INNER JOIN productos p ON p.id_producto = vd.id_producto
+      LEFT JOIN inventario_lotes il ON il.id_lote = vd.id_lote
+      LEFT JOIN (
+        SELECT
+          id_detalle,
+          COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
+        FROM ventas_devoluciones_detalle
+        GROUP BY id_detalle
+      ) dev ON dev.id_detalle = vd.id_detalle
+      WHERE vd.id_venta = $1
+      ORDER BY vd.id_detalle ASC
+      `,
+      [id]
+    );
+
+    const montoDevueltoResultado = await pool.query(
+      `
+      SELECT COALESCE(SUM(monto_devuelto), 0)::numeric(12,2) AS monto_devuelto
+      FROM ventas_devoluciones
+      WHERE id_venta = $1
+        AND estado = 'APLICADA'
+      `,
+      [id]
+    );
+
+    return res.json({
+      ok: true,
+      venta: {
+        ...venta,
+        monto_devuelto: Number(montoDevueltoResultado.rows[0]?.monto_devuelto || 0),
+      },
+      productos: detalleResultado.rows,
+    });
+  } catch (error) {
+    console.error('Error al obtener información de devolución:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al obtener información de devolución',
+    });
   }
 };
 
@@ -1533,6 +1892,22 @@ export const obtenerVenta = async (req, res) => {
       [id]
     );
 
+    const pagosResultado = await pool.query(
+      `
+      SELECT
+        id_pago,
+        id_venta,
+        metodo_pago,
+        monto,
+        referencia,
+        fecha_pago
+      FROM ventas_pagos
+      WHERE id_venta = $1
+      ORDER BY id_pago ASC
+      `,
+      [id]
+    );
+
     const lotesResultado = await pool.query(
       `
       SELECT
@@ -1562,6 +1937,7 @@ export const obtenerVenta = async (req, res) => {
       ok: true,
       venta: ventaResultado.rows[0],
       detalle: detalleResultado.rows,
+      pagos: pagosResultado.rows,
       lotes: lotesResultado.rows,
     });
   } catch (error) {
@@ -1571,5 +1947,557 @@ export const obtenerVenta = async (req, res) => {
       ok: false,
       mensaje: 'Error interno al obtener venta',
     });
+  }
+};
+
+
+export const devolverVenta = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+    const { productos, motivo, observaciones } = req.body;
+
+    if (!Array.isArray(productos) || productos.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Debes enviar al menos un producto para devolver',
+      });
+    }
+
+    if (!motivo || !String(motivo).trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El motivo de la devolución es obligatorio',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const ventaResultado = await client.query(
+      `
+  SELECT
+    id_venta,
+    folio,
+    id_sucursal,
+    id_caja,
+    id_sesion,
+    subtotal,
+    descuento,
+    impuesto,
+    total,
+    metodo_pago,
+    estado
+  FROM ventas
+  WHERE id_venta = $1
+  FOR UPDATE
+  `,
+      [id]
+    );
+
+    if (ventaResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Venta no encontrada',
+      });
+    }
+
+    const venta = ventaResultado.rows[0];
+    const estadoVenta = String(venta.estado || '').toUpperCase();
+
+    if (!estadosVentaConDevolucionPermitida.includes(estadoVenta)) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: `No se puede devolver una venta con estado ${estadoVenta}`,
+      });
+    }
+
+    const sesionResultado = await client.query(
+      `
+      SELECT id_sesion, estado
+      FROM caja_sesiones
+      WHERE id_sesion = $1
+      `,
+      [venta.id_sesion]
+    );
+
+    if (sesionResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró la sesión de caja de la venta',
+      });
+    }
+
+    if (sesionResultado.rows[0].estado !== 'ABIERTA') {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'La caja de esta venta ya está cerrada. Por ahora solo se permiten devoluciones de ventas de la caja abierta.',
+      });
+    }
+
+    let montoDevueltoTotal = 0;
+    const detallesDevueltos = [];
+
+    for (const item of productos) {
+      const idDetalle = Number(item.id_detalle);
+      const cantidadSolicitada = Number(item.cantidad || 0);
+
+      if (!idDetalle || cantidadSolicitada <= 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'Cada producto debe incluir id_detalle y cantidad mayor a cero',
+        });
+      }
+
+      const detalleResultado = await client.query(
+        `
+        SELECT
+          vd.id_detalle,
+          vd.id_venta,
+          vd.id_producto,
+          p.nombre AS producto,
+          vd.cantidad,
+          vd.precio_unitario,
+          vd.subtotal
+        FROM venta_detalle vd
+        INNER JOIN productos p ON p.id_producto = vd.id_producto
+        WHERE vd.id_detalle = $1
+          AND vd.id_venta = $2
+        FOR UPDATE
+        `,
+        [idDetalle, venta.id_venta]
+      );
+
+      if (detalleResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: `No se encontró el detalle de venta ${idDetalle}`,
+        });
+      }
+
+      const detalle = detalleResultado.rows[0];
+
+      const devueltoResultado = await client.query(
+        `
+        SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
+        FROM ventas_devoluciones_detalle
+        WHERE id_detalle = $1
+        `,
+        [idDetalle]
+      );
+
+      const cantidadVendida = Number(detalle.cantidad || 0);
+      const cantidadYaDevuelta = Number(
+        devueltoResultado.rows[0]?.cantidad_devuelta || 0
+      );
+      const cantidadDisponible = cantidadVendida - cantidadYaDevuelta;
+
+      if (cantidadSolicitada > cantidadDisponible) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `No puedes devolver ${cantidadSolicitada} de ${detalle.producto}. Disponible para devolver: ${cantidadDisponible}`,
+        });
+      }
+
+      const subtotalDetalle = Number(detalle.subtotal || 0);
+      const totalVenta = Number(venta.total || 0);
+      const subtotalVenta = Number(venta.subtotal || 0);
+
+      const factorTotalVenta =
+        subtotalVenta > 0
+          ? totalVenta / subtotalVenta
+          : 1;
+
+      const precioProporcionalSubtotal = redondearDos(
+        subtotalDetalle / cantidadVendida
+      );
+
+      const subtotalDevuelto = redondearDos(
+        precioProporcionalSubtotal * cantidadSolicitada
+      );
+
+      const totalDevueltoConImpuesto = redondearDos(
+        subtotalDevuelto * factorTotalVenta
+      );
+
+      montoDevueltoTotal += totalDevueltoConImpuesto;
+
+      detallesDevueltos.push({
+        id_detalle: detalle.id_detalle,
+        id_producto: detalle.id_producto,
+        producto: detalle.producto,
+        cantidad_devuelta: cantidadSolicitada,
+        precio_unitario: precioProporcionalSubtotal,
+        subtotal_devuelto: subtotalDevuelto,
+      });
+    }
+
+    montoDevueltoTotal = redondearDos(montoDevueltoTotal);
+
+    if (montoDevueltoTotal <= 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El monto de la devolución debe ser mayor a cero',
+      });
+    }
+
+    const folioDevolucion = generarFolioDevolucion();
+
+    const devolucionResultado = await client.query(
+      `
+      INSERT INTO ventas_devoluciones (
+        id_venta,
+        id_sesion,
+        id_sucursal,
+        id_usuario,
+        folio_devolucion,
+        metodo_pago_original,
+        monto_devuelto,
+        motivo,
+        observaciones,
+        estado
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'APLICADA')
+      RETURNING *
+      `,
+      [
+        venta.id_venta,
+        venta.id_sesion,
+        venta.id_sucursal,
+        req.usuario.id_usuario,
+        folioDevolucion,
+        venta.metodo_pago,
+        montoDevueltoTotal,
+        motivo.trim(),
+        observaciones ? observaciones.trim() : null,
+      ]
+    );
+
+    const devolucion = devolucionResultado.rows[0];
+
+    for (const detalle of detallesDevueltos) {
+      let cantidadPendienteRestituir = Number(detalle.cantidad_devuelta);
+
+      const lotesVentaResultado = await client.query(
+        `
+        SELECT
+          im.id_lote,
+          il.lote,
+          im.cantidad,
+          im.stock_nuevo
+        FROM inventario_movimientos im
+        LEFT JOIN inventario_lotes il ON il.id_lote = im.id_lote
+        WHERE im.referencia = $1
+          AND im.tipo_movimiento = 'VENTA'
+          AND im.id_producto = $2
+        ORDER BY im.fecha_movimiento ASC, im.id_movimiento ASC
+        `,
+        [venta.folio, detalle.id_producto]
+      );
+
+      if (lotesVentaResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `No se encontraron movimientos de inventario de venta para ${detalle.producto}`,
+        });
+      }
+
+      for (const loteVenta of lotesVentaResultado.rows) {
+        if (cantidadPendienteRestituir <= 0) break;
+
+        const devueltoPorLoteResultado = await client.query(
+          `
+          SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
+          FROM ventas_devoluciones_detalle
+          WHERE id_venta = $1
+            AND id_producto = $2
+            AND id_lote IS NOT DISTINCT FROM $3
+          `,
+          [venta.id_venta, detalle.id_producto, loteVenta.id_lote]
+        );
+
+        const cantidadLoteVendida = Number(loteVenta.cantidad || 0);
+        const cantidadLoteYaDevuelta = Number(
+          devueltoPorLoteResultado.rows[0]?.cantidad_devuelta || 0
+        );
+        const cantidadLoteDisponible =
+          cantidadLoteVendida - cantidadLoteYaDevuelta;
+
+        if (cantidadLoteDisponible <= 0) continue;
+
+        const cantidadARestituir = Math.min(
+          cantidadPendienteRestituir,
+          cantidadLoteDisponible
+        );
+
+        const loteActualResultado = await client.query(
+          `
+          SELECT
+            id_lote,
+            stock_actual
+          FROM inventario_lotes
+          WHERE id_lote = $1
+          FOR UPDATE
+          `,
+          [loteVenta.id_lote]
+        );
+
+        if (loteActualResultado.rows.length === 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(404).json({
+            ok: false,
+            mensaje: `No se encontró el lote para restituir ${detalle.producto}`,
+          });
+        }
+
+        const stockLoteAnterior = Number(
+          loteActualResultado.rows[0].stock_actual || 0
+        );
+        const stockLoteNuevo = redondearDos(
+          stockLoteAnterior + cantidadARestituir
+        );
+
+        await client.query(
+          `
+          UPDATE inventario_lotes
+          SET
+            stock_actual = $1,
+            activo = true,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_lote = $2
+          `,
+          [stockLoteNuevo, loteVenta.id_lote]
+        );
+
+        const inventarioResultado = await client.query(
+          `
+          SELECT
+            id_inventario,
+            stock_actual
+          FROM inventario_sucursal
+          WHERE id_sucursal = $1
+            AND id_producto = $2
+          FOR UPDATE
+          `,
+          [venta.id_sucursal, detalle.id_producto]
+        );
+
+        if (inventarioResultado.rows.length === 0) {
+          await client.query('ROLLBACK');
+
+          return res.status(404).json({
+            ok: false,
+            mensaje: `No se encontró inventario de sucursal para ${detalle.producto}`,
+          });
+        }
+
+        const stockSucursalAnterior = Number(
+          inventarioResultado.rows[0].stock_actual || 0
+        );
+        const stockSucursalNuevo = redondearDos(
+          stockSucursalAnterior + cantidadARestituir
+        );
+
+        await client.query(
+          `
+          UPDATE inventario_sucursal
+          SET
+            stock_actual = $1,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+          WHERE id_sucursal = $2
+            AND id_producto = $3
+          `,
+          [stockSucursalNuevo, venta.id_sucursal, detalle.id_producto]
+        );
+
+        const subtotalParcial = redondearDos(
+          detalle.precio_unitario * cantidadARestituir
+        );
+
+        await client.query(
+          `
+          INSERT INTO ventas_devoluciones_detalle (
+            id_devolucion,
+            id_venta,
+            id_detalle,
+            id_producto,
+            id_lote,
+            producto,
+            cantidad_devuelta,
+            precio_unitario,
+            subtotal_devuelto
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          `,
+          [
+            devolucion.id_devolucion,
+            venta.id_venta,
+            detalle.id_detalle,
+            detalle.id_producto,
+            loteVenta.id_lote,
+            detalle.producto,
+            cantidadARestituir,
+            detalle.precio_unitario,
+            subtotalParcial,
+          ]
+        );
+
+        await client.query(
+          `
+          INSERT INTO inventario_movimientos (
+            id_sucursal,
+            id_producto,
+            id_lote,
+            tipo_movimiento,
+            cantidad,
+            stock_anterior,
+            stock_nuevo,
+            referencia,
+            observaciones,
+            id_usuario
+          )
+          VALUES ($1,$2,$3,'DEVOLUCION_VENTA',$4,$5,$6,$7,$8,$9)
+          `,
+          [
+            venta.id_sucursal,
+            detalle.id_producto,
+            loteVenta.id_lote,
+            cantidadARestituir,
+            stockSucursalAnterior,
+            stockSucursalNuevo,
+            folioDevolucion,
+            `Devolución ${folioDevolucion} de venta ${venta.folio} | ${motivo.trim()}`,
+            req.usuario.id_usuario,
+          ]
+        );
+
+        cantidadPendienteRestituir = redondearDos(
+          cantidadPendienteRestituir - cantidadARestituir
+        );
+      }
+
+      if (cantidadPendienteRestituir > 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `No se pudo restituir completamente ${detalle.producto}. Pendiente: ${cantidadPendienteRestituir}`,
+        });
+      }
+    }
+
+    const totalVendidoResultado = await client.query(
+      `
+      SELECT COALESCE(SUM(cantidad), 0)::numeric(12,2) AS cantidad_vendida
+      FROM venta_detalle
+      WHERE id_venta = $1
+      `,
+      [venta.id_venta]
+    );
+
+    const totalDevueltoResultado = await client.query(
+      `
+      SELECT COALESCE(SUM(cantidad_devuelta), 0)::numeric(12,2) AS cantidad_devuelta
+      FROM ventas_devoluciones_detalle
+      WHERE id_venta = $1
+      `,
+      [venta.id_venta]
+    );
+
+    const cantidadVendidaTotal = Number(
+      totalVendidoResultado.rows[0]?.cantidad_vendida || 0
+    );
+    const cantidadDevueltaTotal = Number(
+      totalDevueltoResultado.rows[0]?.cantidad_devuelta || 0
+    );
+
+    const nuevoEstadoVenta =
+      cantidadDevueltaTotal >= cantidadVendidaTotal
+        ? 'DEVUELTA'
+        : 'DEVUELTA_PARCIAL';
+
+    const ventaActualizadaResultado = await client.query(
+      `
+      UPDATE ventas
+      SET estado = $1
+      WHERE id_venta = $2
+      RETURNING *
+      `,
+      [nuevoEstadoVenta, venta.id_venta]
+    );
+
+    await client.query(
+      `
+      INSERT INTO caja_movimientos (
+        id_sesion,
+        id_sucursal,
+        tipo_movimiento,
+        concepto,
+        monto,
+        metodo_pago,
+        referencia,
+        observaciones,
+        id_usuario
+      )
+      VALUES ($1,$2,'DEVOLUCION_VENTA',$3,$4,$5,$6,$7,$8)
+      `,
+      [
+        venta.id_sesion,
+        venta.id_sucursal,
+        `Devolución de venta ${venta.folio}`,
+        montoDevueltoTotal,
+        venta.metodo_pago,
+        folioDevolucion,
+        `Devolución ligada a venta ${venta.folio} | Motivo: ${motivo.trim()}`,
+        req.usuario.id_usuario,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Devolución aplicada correctamente',
+      devolucion,
+      venta: ventaActualizadaResultado.rows[0],
+      resumen: {
+        folio_devolucion: folioDevolucion,
+        folio_venta: venta.folio,
+        metodo_pago_original: venta.metodo_pago,
+        monto_devuelto: montoDevueltoTotal,
+        estado_venta: nuevoEstadoVenta,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Error al devolver venta:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: error.message || 'Error interno al devolver venta',
+    });
+  } finally {
+    client.release();
   }
 };

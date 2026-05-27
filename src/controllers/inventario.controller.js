@@ -61,6 +61,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
         p.precio_compra,
         p.precio_venta,
         p.puntos_por_unidad,
+        p.activo,
         i.stock_actual,
         i.stock_minimo,
         i.ubicacion,
@@ -70,11 +71,6 @@ export const listarInventarioPorSucursal = async (req, res) => {
           ELSE false
         END AS bajo_stock,
 
-        /*
-          OFERTAS POR CATEGORÍA
-          Si existe una oferta activa para la categoría del producto
-          y la fecha actual está dentro del rango, se calcula el precio final.
-        */
         oc.id_oferta,
         oc.nombre AS oferta_nombre,
         oc.porcentaje_descuento,
@@ -144,6 +140,7 @@ export const listarInventarioPorSucursal = async (req, res) => {
        AND lotes.id_producto = i.id_producto
 
       WHERE i.id_sucursal = $1
+        AND p.activo = true
     `;
 
     const params = [sucursal];
@@ -240,6 +237,7 @@ export const asignarInventario = async (req, res) => {
     const {
       id_sucursal,
       id_producto,
+      id_proveedor,
       stock_inicial,
       stock_minimo,
       ubicacion,
@@ -313,21 +311,23 @@ export const asignarInventario = async (req, res) => {
     if (stockInicial > 0) {
       const loteResultado = await client.query(
         `
-        INSERT INTO inventario_lotes (
-          id_sucursal,
-          id_producto,
-          lote,
-          fecha_caducidad,
-          stock_actual,
-          precio_compra,
-          activo
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,true)
-        RETURNING *
+      INSERT INTO inventario_lotes (
+  id_sucursal,
+  id_producto,
+  id_proveedor,
+  lote,
+  fecha_caducidad,
+  stock_actual,
+  precio_compra,
+  activo
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,true)
+RETURNING *
         `,
         [
           id_sucursal,
           id_producto,
+          id_proveedor || null,
           loteNormalizado,
           fecha_caducidad || null,
           stockInicial,
@@ -340,24 +340,26 @@ export const asignarInventario = async (req, res) => {
 
     await client.query(
       `
-      INSERT INTO inventario_movimientos (
-        id_sucursal,
-        id_producto,
-        id_lote,
-        tipo_movimiento,
-        cantidad,
-        stock_anterior,
-        stock_nuevo,
-        referencia,
-        observaciones,
-        id_usuario
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+   INSERT INTO inventario_movimientos (
+  id_sucursal,
+  id_producto,
+  id_lote,
+  id_proveedor,
+  tipo_movimiento,
+  cantidad,
+  stock_anterior,
+  stock_nuevo,
+  referencia,
+  observaciones,
+  id_usuario
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       `,
       [
         id_sucursal,
         id_producto,
         loteCreado?.id_lote || null,
+        id_proveedor || null,
         'STOCK_INICIAL',
         stockInicial,
         0,
@@ -397,6 +399,7 @@ export const ajustarInventario = async (req, res) => {
     const {
       id_sucursal,
       id_producto,
+      id_proveedor,
       id_lote,
       tipo_movimiento,
       cantidad,
@@ -408,7 +411,6 @@ export const ajustarInventario = async (req, res) => {
       referencia,
       observaciones,
     } = req.body;
-
     if (!id_sucursal || !id_producto || !tipo_movimiento || cantidad === undefined) {
       return res.status(400).json({
         ok: false,
@@ -495,18 +497,20 @@ export const ajustarInventario = async (req, res) => {
 
         const loteActualizado = await client.query(
           `
-          UPDATE inventario_lotes
-          SET
-            stock_actual = $1,
-            precio_compra = COALESCE($2, precio_compra),
-            activo = true,
-            fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_lote = $3
-          RETURNING *
+UPDATE inventario_lotes
+SET
+  stock_actual = $1,
+  precio_compra = COALESCE($2, precio_compra),
+  id_proveedor = COALESCE($3, id_proveedor),
+  activo = true,
+  fecha_actualizacion = CURRENT_TIMESTAMP
+WHERE id_lote = $4
+RETURNING *
           `,
           [
             nuevoStockLote,
             precio_compra || null,
+            id_proveedor || null,
             loteActual.id_lote,
           ]
         );
@@ -515,21 +519,23 @@ export const ajustarInventario = async (req, res) => {
       } else {
         const loteNuevo = await client.query(
           `
-          INSERT INTO inventario_lotes (
-            id_sucursal,
-            id_producto,
-            lote,
-            fecha_caducidad,
-            stock_actual,
-            precio_compra,
-            activo
-          )
-          VALUES ($1,$2,$3,$4,$5,$6,true)
-          RETURNING *
+  INSERT INTO inventario_lotes (
+  id_sucursal,
+  id_producto,
+  id_proveedor,
+  lote,
+  fecha_caducidad,
+  stock_actual,
+  precio_compra,
+  activo
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,true)
+RETURNING *
           `,
           [
             id_sucursal,
             id_producto,
+            id_proveedor || null,
             loteNormalizado,
             fecha_caducidad || null,
             cantidadMovimiento,
@@ -684,25 +690,27 @@ export const ajustarInventario = async (req, res) => {
 
     const movimiento = await client.query(
       `
-      INSERT INTO inventario_movimientos (
-        id_sucursal,
-        id_producto,
-        id_lote,
-        tipo_movimiento,
-        cantidad,
-        stock_anterior,
-        stock_nuevo,
-        referencia,
-        observaciones,
-        id_usuario
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      RETURNING *
+ INSERT INTO inventario_movimientos (
+  id_sucursal,
+  id_producto,
+  id_lote,
+  id_proveedor,
+  tipo_movimiento,
+  cantidad,
+  stock_anterior,
+  stock_nuevo,
+  referencia,
+  observaciones,
+  id_usuario
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+RETURNING *
       `,
       [
         id_sucursal,
         id_producto,
         loteMovimientoId,
+        id_proveedor || null,
         tipo_movimiento,
         cantidadMovimiento,
         stockAnterior,
@@ -737,7 +745,7 @@ export const ajustarInventario = async (req, res) => {
 
 export const listarMovimientosInventario = async (req, res) => {
   try {
-    const { sucursal, producto, tipo } = req.query;
+    const { sucursal, producto, tipo, fecha_inicio, fecha_fin } = req.query;
 
     if (!sucursal) {
       return res.status(400).json({
@@ -751,26 +759,40 @@ export const listarMovimientosInventario = async (req, res) => {
         m.id_movimiento,
         m.id_sucursal,
         s.nombre AS sucursal,
+
         m.id_producto,
         p.nombre AS producto,
         p.codigo_barras,
+
         m.id_lote,
         il.lote,
         il.fecha_caducidad,
+
+        m.id_proveedor,
+        prv.nombre AS proveedor,
+
         m.tipo_movimiento,
         m.cantidad,
         m.stock_anterior,
         m.stock_nuevo,
         m.referencia,
         m.observaciones,
+
         m.id_usuario,
         u.nombre AS usuario,
+
         m.fecha_movimiento
       FROM inventario_movimientos m
-      INNER JOIN sucursales s ON s.id_sucursal = m.id_sucursal
-      INNER JOIN productos p ON p.id_producto = m.id_producto
-      LEFT JOIN usuarios u ON u.id_usuario = m.id_usuario
-      LEFT JOIN inventario_lotes il ON il.id_lote = m.id_lote
+      INNER JOIN sucursales s 
+        ON s.id_sucursal = m.id_sucursal
+      INNER JOIN productos p 
+        ON p.id_producto = m.id_producto
+      LEFT JOIN usuarios u 
+        ON u.id_usuario = m.id_usuario
+      LEFT JOIN inventario_lotes il 
+        ON il.id_lote = m.id_lote
+      LEFT JOIN proveedores prv 
+        ON prv.id_proveedor = m.id_proveedor
       WHERE m.id_sucursal = $1
     `;
 
@@ -786,7 +808,19 @@ export const listarMovimientosInventario = async (req, res) => {
       query += ` AND m.tipo_movimiento = $${params.length} `;
     }
 
-    query += ` ORDER BY m.fecha_movimiento DESC `;
+    if (fecha_inicio) {
+      params.push(fecha_inicio);
+      query += ` AND m.fecha_movimiento >= $${params.length}::date `;
+    }
+
+    if (fecha_fin) {
+      params.push(fecha_fin);
+      query += ` AND m.fecha_movimiento < ($${params.length}::date + INTERVAL '1 day') `;
+    }
+
+    query += `
+      ORDER BY m.fecha_movimiento DESC
+    `;
 
     const resultado = await pool.query(query, params);
 
@@ -820,9 +854,18 @@ export const listarLotesProducto = async (req, res) => {
         il.id_lote,
         il.id_sucursal,
         s.nombre AS sucursal,
+
         il.id_producto,
         p.nombre AS producto,
         p.codigo_barras,
+
+        il.id_proveedor,
+        prv.nombre AS proveedor,
+
+        il.id_compra,
+        co.folio AS folio_compra,
+        il.id_compra_detalle,
+
         il.lote,
         il.fecha_caducidad,
         il.stock_actual,
@@ -830,19 +873,27 @@ export const listarLotesProducto = async (req, res) => {
         il.activo,
         il.fecha_entrada,
         il.fecha_actualizacion,
+
         CASE
           WHEN il.fecha_caducidad IS NULL THEN false
           WHEN il.fecha_caducidad <= CURRENT_DATE + INTERVAL '90 days' THEN true
           ELSE false
         END AS caducidad_proxima,
+
         CASE
           WHEN il.fecha_caducidad IS NULL THEN false
           WHEN il.fecha_caducidad < CURRENT_DATE THEN true
           ELSE false
         END AS caducado
       FROM inventario_lotes il
-      INNER JOIN sucursales s ON s.id_sucursal = il.id_sucursal
-      INNER JOIN productos p ON p.id_producto = il.id_producto
+      INNER JOIN sucursales s 
+        ON s.id_sucursal = il.id_sucursal
+      INNER JOIN productos p 
+        ON p.id_producto = il.id_producto
+      LEFT JOIN proveedores prv 
+        ON prv.id_proveedor = il.id_proveedor
+      LEFT JOIN compras co 
+        ON co.id_compra = il.id_compra
       WHERE il.id_sucursal = $1
     `;
 
@@ -1108,12 +1159,12 @@ export const consultarStockSucursales = async (req, res) => {
 
     const textoBusqueda = String(
       buscar ||
-        busqueda ||
-        nombre ||
-        codigo_barras ||
-        codigo ||
-        presentacion ||
-        ''
+      busqueda ||
+      nombre ||
+      codigo_barras ||
+      codigo ||
+      presentacion ||
+      ''
     ).trim();
 
     if (!textoBusqueda) {

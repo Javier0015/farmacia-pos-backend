@@ -151,6 +151,7 @@ export const crearCompra = async (req, res) => {
         descuento: descuentoProducto = 0,
         lote,
         fecha_caducidad,
+        ubicacion,
         observaciones: observacionesDetalle,
       } = item;
 
@@ -224,6 +225,7 @@ export const crearCompra = async (req, res) => {
         subtotal: subtotalProducto,
         lote: normalizarLote(lote),
         fecha_caducidad: fecha_caducidad || null,
+        ubicacion: ubicacion?.trim() || null,
         observaciones: observacionesDetalle || null,
       });
     }
@@ -324,21 +326,22 @@ export const crearCompra = async (req, res) => {
     const compra = compraResultado.rows[0];
 
     for (const item of productosProcesados) {
-      await client.query(
+      const detalleCompraResultado = await client.query(
         `
-        INSERT INTO compra_detalle (
-          id_compra,
-          id_producto,
-          cantidad,
-          precio_compra,
-          descuento,
-          subtotal,
-          lote,
-          fecha_caducidad,
-          observaciones
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        `,
+  INSERT INTO compra_detalle (
+    id_compra,
+    id_producto,
+    cantidad,
+    precio_compra,
+    descuento,
+    subtotal,
+    lote,
+    fecha_caducidad,
+    observaciones
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+  RETURNING *
+  `,
         [
           compra.id_compra,
           item.id_producto,
@@ -351,6 +354,8 @@ export const crearCompra = async (req, res) => {
           item.observaciones,
         ]
       );
+
+      const detalleCompra = detalleCompraResultado.rows[0];
 
       const inventarioActual = await client.query(
         `
@@ -369,16 +374,21 @@ export const crearCompra = async (req, res) => {
       if (inventarioActual.rows.length === 0) {
         await client.query(
           `
-          INSERT INTO inventario_sucursal (
+    INSERT INTO inventario_sucursal (
+      id_sucursal,
+      id_producto,
+      stock_actual,
+      stock_minimo,
+      ubicacion
+    )
+    VALUES ($1,$2,$3,0,$4)
+    `,
+          [
             id_sucursal,
-            id_producto,
-            stock_actual,
-            stock_minimo,
-            ubicacion
-          )
-          VALUES ($1,$2,$3,0,NULL)
-          `,
-          [id_sucursal, item.id_producto, item.cantidad]
+            item.id_producto,
+            item.cantidad,
+            item.ubicacion,
+          ]
         );
       } else {
         stockAnterior = Number(inventarioActual.rows[0].stock_actual || 0);
@@ -386,14 +396,20 @@ export const crearCompra = async (req, res) => {
 
         await client.query(
           `
-          UPDATE inventario_sucursal
-          SET
-            stock_actual = $1,
-            fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_sucursal = $2
-          AND id_producto = $3
-          `,
-          [stockNuevo, id_sucursal, item.id_producto]
+    UPDATE inventario_sucursal
+    SET
+      stock_actual = $1,
+      ubicacion = COALESCE(NULLIF($2, ''), ubicacion),
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE id_sucursal = $3
+    AND id_producto = $4
+    `,
+          [
+            stockNuevo,
+            item.ubicacion,
+            id_sucursal,
+            item.id_producto,
+          ]
         );
       }
 
@@ -430,14 +446,20 @@ export const crearCompra = async (req, res) => {
           SET
             stock_actual = $1,
             precio_compra = $2,
+            id_proveedor = $3,
+            id_compra = $4,
+            id_compra_detalle = $5,
             activo = true,
             fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_lote = $3
+          WHERE id_lote = $6
           RETURNING *
           `,
           [
             nuevoStockLote,
             item.precio_compra,
+            id_proveedor,
+            compra.id_compra,
+            detalleCompra.id_detalle,
             loteActual.id_lote,
           ]
         );
@@ -446,21 +468,27 @@ export const crearCompra = async (req, res) => {
       } else {
         const loteNuevo = await client.query(
           `
-          INSERT INTO inventario_lotes (
-            id_sucursal,
-            id_producto,
-            lote,
-            fecha_caducidad,
-            stock_actual,
-            precio_compra,
-            activo
-          )
-          VALUES ($1,$2,$3,$4,$5,$6,true)
-          RETURNING *
+         INSERT INTO inventario_lotes (
+  id_sucursal,
+  id_producto,
+  id_proveedor,
+  id_compra,
+  id_compra_detalle,
+  lote,
+  fecha_caducidad,
+  stock_actual,
+  precio_compra,
+  activo
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
+RETURNING *
           `,
           [
             id_sucursal,
             item.id_producto,
+            id_proveedor,
+            compra.id_compra,
+            detalleCompra.id_detalle,
             item.lote,
             item.fecha_caducidad,
             item.cantidad,
@@ -473,29 +501,31 @@ export const crearCompra = async (req, res) => {
 
       await client.query(
         `
-        INSERT INTO inventario_movimientos (
-          id_sucursal,
-          id_producto,
-          id_lote,
-          tipo_movimiento,
-          cantidad,
-          stock_anterior,
-          stock_nuevo,
-          referencia,
-          observaciones,
-          id_usuario
-        )
-        VALUES ($1,$2,$3,'ENTRADA',$4,$5,$6,$7,$8,$9)
-        `,
+  INSERT INTO inventario_movimientos (
+    id_sucursal,
+    id_producto,
+    id_lote,
+    id_proveedor,
+    tipo_movimiento,
+    cantidad,
+    stock_anterior,
+    stock_nuevo,
+    referencia,
+    observaciones,
+    id_usuario
+  )
+  VALUES ($1,$2,$3,$4,'ENTRADA',$5,$6,$7,$8,$9,$10)
+  `,
         [
           id_sucursal,
           item.id_producto,
           idLoteMovimiento,
+          id_proveedor,
           item.cantidad,
           stockAnterior,
           stockNuevo,
           folio,
-          `Entrada por compra ${folio} | Lote ${item.lote}`,
+          `Entrada por compra ${folio} | Lote ${item.lote} | Proveedor ${proveedorExiste.rows[0].nombre}`,
           req.usuario.id_usuario,
         ]
       );
@@ -716,41 +746,57 @@ export const obtenerCompra = async (req, res) => {
 
     const detalleResultado = await pool.query(
       `
-      SELECT
-        cd.id_detalle,
-        cd.id_producto,
-        pr.codigo_barras,
-        pr.nombre AS producto,
-        cd.cantidad,
-        cd.precio_compra,
-        cd.descuento,
-        cd.subtotal,
-        cd.lote,
-        cd.fecha_caducidad,
-        cd.observaciones
-      FROM compra_detalle cd
-      INNER JOIN productos pr ON pr.id_producto = cd.id_producto
-      WHERE cd.id_compra = $1
-      ORDER BY cd.id_detalle ASC
-      `,
+  SELECT
+    cd.id_detalle,
+    cd.id_producto,
+    pr.codigo_barras,
+    pr.nombre AS producto,
+    cd.cantidad,
+    cd.precio_compra,
+    cd.descuento,
+    cd.subtotal,
+    cd.lote,
+    cd.fecha_caducidad,
+    inv.ubicacion,
+    cd.observaciones
+  FROM compra_detalle cd
+  INNER JOIN productos pr ON pr.id_producto = cd.id_producto
+  LEFT JOIN inventario_sucursal inv 
+    ON inv.id_sucursal = (
+      SELECT id_sucursal 
+      FROM compras 
+      WHERE id_compra = cd.id_compra
+    )
+    AND inv.id_producto = cd.id_producto
+  WHERE cd.id_compra = $1
+  ORDER BY cd.id_detalle ASC
+  `,
       [id]
     );
 
     const pagosResultado = await pool.query(
       `
-      SELECT
-        pp.id_pago,
-        pp.monto,
-        pp.metodo_pago,
-        pp.referencia,
-        pp.observaciones,
-        pp.fecha_pago,
-        u.nombre AS usuario
-      FROM pagos_proveedor pp
-      INNER JOIN usuarios u ON u.id_usuario = pp.id_usuario
-      WHERE pp.id_compra = $1
-      ORDER BY pp.fecha_pago DESC
-      `,
+  SELECT
+    pp.id_pago,
+    pp.id_compra,
+    pp.id_proveedor,
+    pp.id_sucursal,
+    pp.id_sesion,
+    pp.monto,
+    pp.metodo_pago,
+    pp.referencia,
+    pp.observaciones,
+    pp.fecha_pago,
+    cs.id_caja,
+    cj.nombre AS caja,
+    u.nombre AS usuario
+  FROM pagos_proveedor pp
+  INNER JOIN usuarios u ON u.id_usuario = pp.id_usuario
+  LEFT JOIN caja_sesiones cs ON cs.id_sesion = pp.id_sesion
+  LEFT JOIN cajas cj ON cj.id_caja = cs.id_caja
+  WHERE pp.id_compra = $1
+  ORDER BY pp.fecha_pago DESC
+  `,
       [id]
     );
 
@@ -834,6 +880,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (compraActualResultado.rows.length === 0) {
       await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'Compra no encontrada',
@@ -844,6 +891,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (compraActual.estado !== 'PENDIENTE') {
       await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'Solo se pueden editar compras pendientes',
@@ -861,6 +909,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (proveedorExiste.rows.length === 0) {
       await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'Proveedor no encontrado',
@@ -869,6 +918,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (!proveedorExiste.rows[0].activo) {
       await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'El proveedor está inactivo',
@@ -880,13 +930,14 @@ export const actualizarCompra = async (req, res) => {
       SELECT id_sucursal
       FROM sucursales
       WHERE id_sucursal = $1
-      AND activo = true
+        AND activo = true
       `,
       [id_sucursal]
     );
 
     if (sucursalExiste.rows.length === 0) {
       await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'Sucursal no encontrada o inactiva',
@@ -899,14 +950,15 @@ export const actualizarCompra = async (req, res) => {
         SELECT id_sesion
         FROM caja_sesiones
         WHERE id_sesion = $1
-        AND id_sucursal = $2
-        AND estado = 'ABIERTA'
+          AND id_sucursal = $2
+          AND estado = 'ABIERTA'
         `,
         [id_sesion, id_sucursal]
       );
 
       if (sesionExiste.rows.length === 0) {
         await client.query('ROLLBACK');
+
         return res.status(400).json({
           ok: false,
           mensaje:
@@ -915,6 +967,11 @@ export const actualizarCompra = async (req, res) => {
       }
     }
 
+    /*
+      1. Revertir detalle anterior.
+      Solo permitimos editar compras PENDIENTES, pero aun así validamos que el stock
+      y los lotes todavía tengan existencia suficiente para deshacer la entrada anterior.
+    */
     const detalleAnterior = await client.query(
       `
       SELECT
@@ -930,13 +987,14 @@ export const actualizarCompra = async (req, res) => {
 
     for (const item of detalleAnterior.rows) {
       const cantidadAnterior = Number(item.cantidad || 0);
+      const loteNormalizado = normalizarLote(item.lote);
 
       const inventarioActual = await client.query(
         `
         SELECT id_inventario, stock_actual
         FROM inventario_sucursal
         WHERE id_sucursal = $1
-        AND id_producto = $2
+          AND id_producto = $2
         FOR UPDATE
         `,
         [compraActual.id_sucursal, item.id_producto]
@@ -948,6 +1006,7 @@ export const actualizarCompra = async (req, res) => {
 
         if (stockNuevo < 0) {
           await client.query('ROLLBACK');
+
           return res.status(400).json({
             ok: false,
             mensaje:
@@ -962,25 +1021,23 @@ export const actualizarCompra = async (req, res) => {
             stock_actual = $1,
             fecha_actualizacion = CURRENT_TIMESTAMP
           WHERE id_sucursal = $2
-          AND id_producto = $3
+            AND id_producto = $3
           `,
           [stockNuevo, compraActual.id_sucursal, item.id_producto]
         );
       }
-
-      const loteNormalizado = normalizarLote(item.lote);
 
       const loteActual = await client.query(
         `
         SELECT id_lote, stock_actual
         FROM inventario_lotes
         WHERE id_sucursal = $1
-        AND id_producto = $2
-        AND lote = $3
-        AND (
-          (fecha_caducidad = $4::date)
-          OR (fecha_caducidad IS NULL AND $4::date IS NULL)
-        )
+          AND id_producto = $2
+          AND lote = $3
+          AND (
+            (fecha_caducidad = $4::date)
+            OR (fecha_caducidad IS NULL AND $4::date IS NULL)
+          )
         FOR UPDATE
         `,
         [
@@ -991,12 +1048,15 @@ export const actualizarCompra = async (req, res) => {
         ]
       );
 
+      let idLoteMovimientoReverso = null;
+
       if (loteActual.rows.length > 0) {
         const stockLoteAnterior = Number(loteActual.rows[0].stock_actual || 0);
         const stockLoteNuevo = stockLoteAnterior - cantidadAnterior;
 
         if (stockLoteNuevo < 0) {
           await client.query('ROLLBACK');
+
           return res.status(400).json({
             ok: false,
             mensaje:
@@ -1004,15 +1064,18 @@ export const actualizarCompra = async (req, res) => {
           });
         }
 
+        idLoteMovimientoReverso = loteActual.rows[0].id_lote;
+
         await client.query(
           `
           UPDATE inventario_lotes
           SET
             stock_actual = $1,
+            activo = CASE WHEN $1::numeric <= 0::numeric THEN false ELSE true END,
             fecha_actualizacion = CURRENT_TIMESTAMP
           WHERE id_lote = $2
           `,
-          [stockLoteNuevo, loteActual.rows[0].id_lote]
+          [stockLoteNuevo, idLoteMovimientoReverso]
         );
       }
 
@@ -1022,6 +1085,7 @@ export const actualizarCompra = async (req, res) => {
           id_sucursal,
           id_producto,
           id_lote,
+          id_proveedor,
           tipo_movimiento,
           cantidad,
           stock_anterior,
@@ -1030,14 +1094,16 @@ export const actualizarCompra = async (req, res) => {
           observaciones,
           id_usuario
         )
-        VALUES ($1,$2,NULL,'AJUSTE',$3,NULL,NULL,$4,$5,$6)
+        VALUES ($1,$2,$3,$4,'AJUSTE_NEGATIVO',$5,NULL,NULL,$6,$7,$8)
         `,
         [
           compraActual.id_sucursal,
           item.id_producto,
+          idLoteMovimientoReverso,
+          compraActual.id_proveedor || null,
           cantidadAnterior,
           compraActual.folio,
-          `Reverso por edición de compra ${compraActual.folio}`,
+          `Reverso por edición de compra ${compraActual.folio} | Lote ${loteNormalizado}`,
           req.usuario.id_usuario,
         ]
       );
@@ -1051,6 +1117,9 @@ export const actualizarCompra = async (req, res) => {
       [id]
     );
 
+    /*
+      2. Validar y preparar nuevo detalle.
+    */
     let subtotalCompra = 0;
     const productosProcesados = [];
 
@@ -1062,11 +1131,13 @@ export const actualizarCompra = async (req, res) => {
         descuento: descuentoProducto = 0,
         lote,
         fecha_caducidad,
+        ubicacion,
         observaciones: observacionesDetalle,
       } = item;
 
       if (!id_producto || !cantidad || Number(cantidad) <= 0) {
         await client.query('ROLLBACK');
+
         return res.status(400).json({
           ok: false,
           mensaje: 'Cada producto debe tener id_producto y cantidad mayor a cero',
@@ -1075,6 +1146,7 @@ export const actualizarCompra = async (req, res) => {
 
       if (precio_compra === undefined || Number(precio_compra) < 0) {
         await client.query('ROLLBACK');
+
         return res.status(400).json({
           ok: false,
           mensaje: 'Cada producto debe tener precio de compra válido',
@@ -1092,6 +1164,7 @@ export const actualizarCompra = async (req, res) => {
 
       if (productoExiste.rows.length === 0) {
         await client.query('ROLLBACK');
+
         return res.status(404).json({
           ok: false,
           mensaje: `Producto no encontrado: ${id_producto}`,
@@ -1100,6 +1173,7 @@ export const actualizarCompra = async (req, res) => {
 
       if (!productoExiste.rows[0].activo) {
         await client.query('ROLLBACK');
+
         return res.status(400).json({
           ok: false,
           mensaje: `El producto ${productoExiste.rows[0].nombre} está inactivo`,
@@ -1113,6 +1187,7 @@ export const actualizarCompra = async (req, res) => {
 
       if (subtotalProducto < 0) {
         await client.query('ROLLBACK');
+
         return res.status(400).json({
           ok: false,
           mensaje: `El subtotal del producto ${productoExiste.rows[0].nombre} no puede ser negativo`,
@@ -1130,6 +1205,7 @@ export const actualizarCompra = async (req, res) => {
         subtotal: subtotalProducto,
         lote: normalizarLote(lote),
         fecha_caducidad: fecha_caducidad || null,
+        ubicacion: ubicacion?.trim() || null,
         observaciones: observacionesDetalle || null,
       });
     }
@@ -1145,6 +1221,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (totalCompra < 0) {
       await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'El total de la compra no puede ser negativo',
@@ -1155,6 +1232,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (montoPagadoNum < 0) {
       await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'El monto pagado no puede ser negativo',
@@ -1163,6 +1241,7 @@ export const actualizarCompra = async (req, res) => {
 
     if (montoPagadoNum > totalCompra) {
       await client.query('ROLLBACK');
+
       return res.status(400).json({
         ok: false,
         mensaje: 'El monto pagado no puede ser mayor al total de la compra',
@@ -1181,6 +1260,9 @@ export const actualizarCompra = async (req, res) => {
       estado = 'PAGADA';
     }
 
+    /*
+      3. Actualizar encabezado de compra.
+    */
     let updateQuery = `
       UPDATE compras
       SET
@@ -1219,16 +1301,24 @@ export const actualizarCompra = async (req, res) => {
     }
 
     updateParams.push(id);
+
     updateQuery += `
       WHERE id_compra = $${updateParams.length}
       RETURNING *
     `;
 
-    const compraActualizadaResultado = await client.query(updateQuery, updateParams);
+    const compraActualizadaResultado = await client.query(
+      updateQuery,
+      updateParams
+    );
+
     const compraActualizada = compraActualizadaResultado.rows[0];
 
+    /*
+      4. Insertar nuevo detalle y aplicar nuevas entradas a inventario/lotes.
+    */
     for (const item of productosProcesados) {
-      await client.query(
+      const detalleCompraResultado = await client.query(
         `
         INSERT INTO compra_detalle (
           id_compra,
@@ -1242,6 +1332,7 @@ export const actualizarCompra = async (req, res) => {
           observaciones
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING *
         `,
         [
           compraActualizada.id_compra,
@@ -1256,12 +1347,14 @@ export const actualizarCompra = async (req, res) => {
         ]
       );
 
+      const detalleCompra = detalleCompraResultado.rows[0];
+
       const inventarioActual = await client.query(
         `
         SELECT id_inventario, stock_actual
         FROM inventario_sucursal
         WHERE id_sucursal = $1
-        AND id_producto = $2
+          AND id_producto = $2
         FOR UPDATE
         `,
         [id_sucursal, item.id_producto]
@@ -1273,16 +1366,21 @@ export const actualizarCompra = async (req, res) => {
       if (inventarioActual.rows.length === 0) {
         await client.query(
           `
-          INSERT INTO inventario_sucursal (
+    INSERT INTO inventario_sucursal (
+      id_sucursal,
+      id_producto,
+      stock_actual,
+      stock_minimo,
+      ubicacion
+    )
+    VALUES ($1,$2,$3,0,$4)
+    `,
+          [
             id_sucursal,
-            id_producto,
-            stock_actual,
-            stock_minimo,
-            ubicacion
-          )
-          VALUES ($1,$2,$3,0,NULL)
-          `,
-          [id_sucursal, item.id_producto, item.cantidad]
+            item.id_producto,
+            item.cantidad,
+            item.ubicacion,
+          ]
         );
       } else {
         stockAnterior = Number(inventarioActual.rows[0].stock_actual || 0);
@@ -1290,14 +1388,20 @@ export const actualizarCompra = async (req, res) => {
 
         await client.query(
           `
-          UPDATE inventario_sucursal
-          SET
-            stock_actual = $1,
-            fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_sucursal = $2
-          AND id_producto = $3
-          `,
-          [stockNuevo, id_sucursal, item.id_producto]
+    UPDATE inventario_sucursal
+    SET
+      stock_actual = $1,
+      ubicacion = COALESCE(NULLIF($2, ''), ubicacion),
+      fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE id_sucursal = $3
+      AND id_producto = $4
+    `,
+          [
+            stockNuevo,
+            item.ubicacion,
+            id_sucursal,
+            item.id_producto,
+          ]
         );
       }
 
@@ -1306,12 +1410,12 @@ export const actualizarCompra = async (req, res) => {
         SELECT id_lote, stock_actual
         FROM inventario_lotes
         WHERE id_sucursal = $1
-        AND id_producto = $2
-        AND lote = $3
-        AND (
-          (fecha_caducidad = $4::date)
-          OR (fecha_caducidad IS NULL AND $4::date IS NULL)
-        )
+          AND id_producto = $2
+          AND lote = $3
+          AND (
+            (fecha_caducidad = $4::date)
+            OR (fecha_caducidad IS NULL AND $4::date IS NULL)
+          )
         FOR UPDATE
         `,
         [
@@ -1326,7 +1430,8 @@ export const actualizarCompra = async (req, res) => {
 
       if (loteExistente.rows.length > 0) {
         const loteActual = loteExistente.rows[0];
-        const nuevoStockLote = Number(loteActual.stock_actual || 0) + item.cantidad;
+        const nuevoStockLote =
+          Number(loteActual.stock_actual || 0) + item.cantidad;
 
         const loteActualizado = await client.query(
           `
@@ -1334,14 +1439,20 @@ export const actualizarCompra = async (req, res) => {
           SET
             stock_actual = $1,
             precio_compra = $2,
+            id_proveedor = $3,
+            id_compra = $4,
+            id_compra_detalle = $5,
             activo = true,
             fecha_actualizacion = CURRENT_TIMESTAMP
-          WHERE id_lote = $3
+          WHERE id_lote = $6
           RETURNING *
           `,
           [
             nuevoStockLote,
             item.precio_compra,
+            id_proveedor,
+            compraActualizada.id_compra,
+            detalleCompra.id_detalle,
             loteActual.id_lote,
           ]
         );
@@ -1353,18 +1464,24 @@ export const actualizarCompra = async (req, res) => {
           INSERT INTO inventario_lotes (
             id_sucursal,
             id_producto,
+            id_proveedor,
+            id_compra,
+            id_compra_detalle,
             lote,
             fecha_caducidad,
             stock_actual,
             precio_compra,
             activo
           )
-          VALUES ($1,$2,$3,$4,$5,$6,true)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
           RETURNING *
           `,
           [
             id_sucursal,
             item.id_producto,
+            id_proveedor,
+            compraActualizada.id_compra,
+            detalleCompra.id_detalle,
             item.lote,
             item.fecha_caducidad,
             item.cantidad,
@@ -1381,6 +1498,7 @@ export const actualizarCompra = async (req, res) => {
           id_sucursal,
           id_producto,
           id_lote,
+          id_proveedor,
           tipo_movimiento,
           cantidad,
           stock_anterior,
@@ -1389,20 +1507,108 @@ export const actualizarCompra = async (req, res) => {
           observaciones,
           id_usuario
         )
-        VALUES ($1,$2,$3,'ENTRADA',$4,$5,$6,$7,$8,$9)
+        VALUES ($1,$2,$3,$4,'ENTRADA',$5,$6,$7,$8,$9,$10)
         `,
         [
           id_sucursal,
           item.id_producto,
           idLoteMovimiento,
+          id_proveedor,
           item.cantidad,
           stockAnterior,
           stockNuevo,
           compraActualizada.folio,
-          `Entrada por edición de compra ${compraActualizada.folio} | Lote ${item.lote}`,
+          `Entrada por edición de compra ${compraActualizada.folio} | Lote ${item.lote} | Proveedor ${proveedorExiste.rows[0].nombre}`,
           req.usuario.id_usuario,
         ]
       );
+    }
+
+    /*
+      5. Manejar pago si se capturó monto pagado.
+      Como solo se editan compras pendientes, normalmente no hay pagos previos.
+      Si permites editar monto_pagado aquí, registramos el pago nuevo.
+    */
+    if (montoPagadoNum > 0) {
+      const pagosPrevios = await client.query(
+        `
+        SELECT COALESCE(SUM(monto), 0)::numeric(12,2) AS total_pagado
+        FROM pagos_proveedor
+        WHERE id_compra = $1
+        `,
+        [compraActualizada.id_compra]
+      );
+
+      const totalPagadoPrevio = Number(pagosPrevios.rows[0]?.total_pagado || 0);
+      const montoNuevoPago = montoPagadoNum - totalPagadoPrevio;
+
+      if (montoNuevoPago > 0) {
+        await client.query(
+          `
+          INSERT INTO pagos_proveedor (
+            id_compra,
+            id_proveedor,
+            id_sucursal,
+            id_sesion,
+            id_usuario,
+            monto,
+            metodo_pago,
+            referencia,
+            observaciones
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          `,
+          [
+            compraActualizada.id_compra,
+            id_proveedor,
+            id_sucursal,
+            id_sesion,
+            req.usuario.id_usuario,
+            montoNuevoPago,
+            metodo_pago,
+            compraActualizada.folio,
+            `Pago registrado al editar compra ${compraActualizada.folio}`,
+          ]
+        );
+
+        if (metodo_pago === 'EFECTIVO') {
+          if (!id_sesion) {
+            await client.query('ROLLBACK');
+
+            return res.status(400).json({
+              ok: false,
+              mensaje:
+                'Para pagar en efectivo se requiere una sesión de caja abierta',
+            });
+          }
+
+          await client.query(
+            `
+            INSERT INTO caja_movimientos (
+              id_sesion,
+              id_sucursal,
+              tipo_movimiento,
+              concepto,
+              monto,
+              metodo_pago,
+              referencia,
+              observaciones,
+              id_usuario
+            )
+            VALUES ($1,$2,'PAGO_PROVEEDOR',$3,$4,'EFECTIVO',$5,$6,$7)
+            `,
+            [
+              id_sesion,
+              id_sucursal,
+              `Pago proveedor compra ${compraActualizada.folio}`,
+              montoNuevoPago,
+              compraActualizada.folio,
+              `Salida por pago a proveedor ${proveedorExiste.rows[0].nombre}`,
+              req.usuario.id_usuario,
+            ]
+          );
+        }
+      }
     }
 
     await client.query('COMMIT');
@@ -1417,6 +1623,7 @@ export const actualizarCompra = async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+
     console.error('Error al actualizar compra:', error);
 
     return res.status(500).json({

@@ -158,7 +158,14 @@ export const obtenerResumenDashboard = async (req, res) => {
               CASE 
                 WHEN tipo_movimiento IN ('APERTURA', 'ENTRADA', 'VENTA') 
                   THEN monto
-                WHEN tipo_movimiento IN ('SALIDA', 'GASTO', 'RETIRO', 'PAGO_PROVEEDOR', 'DEVOLUCION')
+                WHEN tipo_movimiento IN (
+                  'SALIDA',
+                  'GASTO',
+                  'RETIRO',
+                  'PAGO_PROVEEDOR',
+                  'DEVOLUCION',
+                  'DEVOLUCION_VENTA'
+                )
                   THEN -monto
                 ELSE 0
               END
@@ -230,6 +237,42 @@ export const obtenerResumenDashboard = async (req, res) => {
       [sucursal]
     );
 
+    const gastosOperativos = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(cm.monto), 0)::NUMERIC AS gastos_operativos,
+        COUNT(*)::INT AS total_gastos_operativos
+      FROM caja_movimientos cm
+      WHERE cm.id_sucursal = $1
+        AND cm.fecha_movimiento BETWEEN $2 AND $3
+        AND UPPER(cm.tipo_movimiento) IN ('GASTO', 'SALIDA', 'PAGO_PROVEEDOR')
+      `,
+      [sucursal, fechaInicio, fechaFin]
+    );
+
+    const gastosOperativosDetalle = await pool.query(
+      `
+      SELECT
+        cm.id_movimiento,
+        cm.fecha_movimiento,
+        cm.tipo_movimiento AS tipo,
+        cm.concepto,
+        cm.metodo_pago,
+        cm.monto,
+        cm.referencia,
+        cm.observaciones,
+        u.nombre AS usuario
+      FROM caja_movimientos cm
+      LEFT JOIN usuarios u ON u.id_usuario = cm.id_usuario
+      WHERE cm.id_sucursal = $1
+        AND cm.fecha_movimiento BETWEEN $2 AND $3
+        AND UPPER(cm.tipo_movimiento) IN ('GASTO', 'SALIDA', 'PAGO_PROVEEDOR')
+      ORDER BY cm.fecha_movimiento DESC
+      LIMIT 500
+      `,
+      [sucursal, fechaInicio, fechaFin]
+    );
+
     const ventasPorDia = await pool.query(
       `
       SELECT
@@ -298,6 +341,68 @@ export const obtenerResumenDashboard = async (req, res) => {
       [sucursal, fechaInicio, fechaFin]
     );
 
+    const gananciasProductosDetalle = await pool.query(
+      `
+      SELECT
+        p.id_producto,
+        p.nombre AS producto,
+
+        COALESCE(SUM(vd.cantidad), 0)::NUMERIC AS cantidad_vendida,
+
+        COALESCE(p.precio_compra, 0)::NUMERIC AS costo_compra_unitario,
+
+        CASE
+          WHEN COALESCE(SUM(vd.cantidad), 0) > 0 THEN
+            (
+              COALESCE(SUM(vd.subtotal), 0)
+              / COALESCE(SUM(vd.cantidad), 0)
+            )
+          ELSE 0
+        END::NUMERIC AS precio_venta_promedio,
+
+        COALESCE(
+          SUM(COALESCE(p.precio_compra, 0) * COALESCE(vd.cantidad, 0)),
+          0
+        )::NUMERIC AS total_costo_compra,
+
+        COALESCE(SUM(vd.subtotal), 0)::NUMERIC AS total_vendido,
+
+        COALESCE(
+          SUM(
+            (COALESCE(vd.precio_unitario, 0) - COALESCE(p.precio_compra, 0))
+            * COALESCE(vd.cantidad, 0)
+          ),
+          0
+        )::NUMERIC AS ganancia,
+
+        CASE 
+          WHEN COALESCE(SUM(vd.subtotal), 0) > 0 THEN
+            (
+              COALESCE(
+                SUM(
+                  (COALESCE(vd.precio_unitario, 0) - COALESCE(p.precio_compra, 0))
+                  * COALESCE(vd.cantidad, 0)
+                ),
+                0
+              ) / COALESCE(SUM(vd.subtotal), 0)
+            ) * 100
+          ELSE 0
+        END::NUMERIC AS margen_porcentaje
+      FROM venta_detalle vd
+      INNER JOIN ventas v ON v.id_venta = vd.id_venta
+      INNER JOIN productos p ON p.id_producto = vd.id_producto
+      WHERE v.id_sucursal = $1
+        AND v.estado = 'COMPLETADA'
+        AND v.fecha_venta BETWEEN $2 AND $3
+      GROUP BY 
+        p.id_producto,
+        p.nombre,
+        p.precio_compra
+      ORDER BY ganancia DESC
+      `,
+      [sucursal, fechaInicio, fechaFin]
+    );
+
     const categoriasMasVendidas = await pool.query(
       `
       SELECT
@@ -341,6 +446,14 @@ export const obtenerResumenDashboard = async (req, res) => {
       gananciaPeriodo.rows[0]?.ganancia_total || 0
     );
 
+    const gastosOperativosTotal = Number(
+      gastosOperativos.rows[0]?.gastos_operativos || 0
+    );
+
+    const totalGastosOperativos = Number(
+      gastosOperativos.rows[0]?.total_gastos_operativos || 0
+    );
+
     return res.json({
       ok: true,
 
@@ -362,6 +475,9 @@ export const obtenerResumenDashboard = async (req, res) => {
         total_productos: Number(productos.rows[0]?.total_productos || 0),
         productos_bajo_stock: Number(bajoStock.rows[0]?.total_bajo_stock || 0),
         productos_caducidad: Number(caducidad.rows[0]?.total_caducidad || 0),
+
+        gastos_operativos: gastosOperativosTotal,
+        total_gastos_operativos: totalGastosOperativos,
 
         caja_abierta: cajaAbierta.rows.length > 0,
         caja_actual: cajaAbierta.rows[0] || null,
@@ -389,6 +505,18 @@ export const obtenerResumenDashboard = async (req, res) => {
         ganancia: Number(item.ganancia || 0),
       })),
 
+      ganancias_productos_detalle: gananciasProductosDetalle.rows.map((item) => ({
+        id_producto: item.id_producto,
+        producto: item.producto,
+        cantidad_vendida: Number(item.cantidad_vendida || 0),
+        costo_compra_unitario: Number(item.costo_compra_unitario || 0),
+        precio_venta_promedio: Number(item.precio_venta_promedio || 0),
+        total_costo_compra: Number(item.total_costo_compra || 0),
+        total_vendido: Number(item.total_vendido || 0),
+        ganancia: Number(item.ganancia || 0),
+        margen_porcentaje: Number(item.margen_porcentaje || 0),
+      })),
+
       categorias_mas_vendidas: categoriasMasVendidas.rows.map((item) => ({
         categoria: item.categoria,
         cantidad: Number(item.cantidad || 0),
@@ -412,6 +540,18 @@ export const obtenerResumenDashboard = async (req, res) => {
         stock_actual: Number(item.stock_actual || 0),
         fecha_caducidad: item.fecha_caducidad,
         dias_restantes: Number(item.dias_restantes || 0),
+      })),
+
+      gastos_operativos_detalle: gastosOperativosDetalle.rows.map((item) => ({
+        id_movimiento: item.id_movimiento,
+        fecha_movimiento: item.fecha_movimiento,
+        tipo: item.tipo,
+        concepto: item.concepto,
+        metodo_pago: item.metodo_pago,
+        monto: Number(item.monto || 0),
+        referencia: item.referencia || '',
+        observaciones: item.observaciones || '',
+        usuario: item.usuario || '—',
       })),
     });
   } catch (error) {

@@ -1,4 +1,4 @@
-/*import pg from 'pg';
+import pg from 'pg';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -29,7 +29,7 @@ pool.on('error', (err) => {
 export default pool;
 export { pool };
 
-*/
+/*
 import pg from 'pg';
 import dotenv from 'dotenv';
 
@@ -54,4 +54,4 @@ export const probarConexion = async () => {
     console.error(error.message);
     process.exit(1);
   }
-};
+};*/

@@ -11,7 +11,9 @@ import { verificarToken } from '../middlewares/auth.middleware.js';
 const router = Router();
 
 const soloSuperAdmin = (req, res, next) => {
-  if (req.usuario?.rol !== 'SUPER_ADMIN') {
+  const rolesPermitidos = ['SUPER_ADMIN', 'CAJERO'];
+
+  if (!rolesPermitidos.includes(req.usuario?.rol)) {
     return res.status(403).json({
       ok: false,
       mensaje: 'No tienes permisos para administrar categorías',
