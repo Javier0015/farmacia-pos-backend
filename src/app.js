@@ -34,7 +34,6 @@ import violenciaLesionRoutes from './routes/violenciaLesion.routes.js';
 import consentimientosRoutes from './routes/consentimientos.routes.js';
 import documentosClinicosRoutes from './routes/documentosClinicos.routes.js';
 
-
 const app = express();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,12 +41,13 @@ const __dirname = path.dirname(__filename);
 
 // Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 app.use(morgan('dev'));
 
 // Archivos públicos subidos
 // Ruta física: backend/uploads
-// URL pública: http://localhost:3001/uploads/...
+// URL pública: https://tu-backend.onrender.com/uploads/...
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Ruta inicial
@@ -55,15 +55,52 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     mensaje: 'API Farmacia POS funcionando correctamente',
+    fecha: new Date(),
   });
 });
 
-// Ruta de prueba
+// Ruta de prueba general
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     mensaje: 'Backend activo',
     fecha: new Date(),
+  });
+});
+
+// Ruta temporal para revisar si Render ya tomó el deploy correcto
+app.get('/api/debug-rutas', (req, res) => {
+  res.json({
+    ok: true,
+    mensaje: 'Debug de rutas activo',
+    backend: 'farmacia-pos-backend',
+    fecha: new Date(),
+    rutas_importantes: {
+      health: '/api/health',
+      auth: '/api/auth',
+      sucursales: '/api/sucursales',
+      productos: '/api/productos',
+      inventario: '/api/inventario',
+      caja: '/api/caja',
+      ventas: '/api/ventas',
+      doctor_shaddai: {
+        base: '/api/doctor-shaddai',
+        mi_perfil: '/api/doctor-shaddai/mi-perfil',
+        expedientes: '/api/doctor-shaddai/expedientes',
+        recetas: '/api/doctor-shaddai/recetas',
+        receta_por_id: '/api/doctor-shaddai/recetas/:id',
+        cancelar_receta: '/api/doctor-shaddai/recetas/:id/cancelar',
+        surtir_receta: '/api/doctor-shaddai/recetas/:id/surtir',
+        nota_medica: '/api/doctor-shaddai/notas-medicas/:idNota',
+      },
+      doctor_fila: '/api/doctor-fila',
+      laboratorio: '/api/laboratorio',
+      notas_medicas: '/api/notas-medicas',
+      referencias: '/api/referencias',
+      violencia_lesion: '/api/violencia-lesion',
+      consentimientos: '/api/consentimientos',
+      documentos_clinicos: '/api/documentos-clinicos',
+    },
   });
 });
 
@@ -98,6 +135,26 @@ app.use('/api/violencia-lesion', violenciaLesionRoutes);
 app.use('/api/consentimientos', consentimientosRoutes);
 app.use('/api/documentos-clinicos', documentosClinicosRoutes);
 
+// Middleware para rutas no encontradas
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    mensaje: 'Ruta no encontrada',
+    metodo: req.method,
+    ruta_solicitada: req.originalUrl,
+    sugerencia: 'Revisa que el endpoint exista y que Render esté usando el último deploy.',
+  });
+});
 
+// Middleware general de errores
+app.use((err, req, res, next) => {
+  console.error('Error general del servidor:', err);
+
+  res.status(err.status || 500).json({
+    ok: false,
+    mensaje: 'Error interno del servidor',
+    error: process.env.NODE_ENV === 'production' ? undefined : err.message,
+  });
+});
 
 export default app;
