@@ -23,7 +23,6 @@ const iniciarServidor = async () => {
 };
 
 iniciarServidor();
-
 /*
 
 import dotenv from 'dotenv';

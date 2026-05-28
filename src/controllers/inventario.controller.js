@@ -926,6 +926,150 @@ export const listarLotesProducto = async (req, res) => {
   }
 };
 
+export const actualizarLote = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id_lote } = req.params;
+
+    const {
+      id_proveedor,
+      lote,
+      fecha_caducidad,
+      precio_compra,
+    } = req.body;
+
+    if (!id_lote) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El ID del lote es obligatorio',
+      });
+    }
+
+    if (!lote || !String(lote).trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El lote es obligatorio',
+      });
+    }
+
+    if (precio_compra !== undefined && precio_compra !== null && Number(precio_compra) < 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El precio de compra no puede ser negativo',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const loteActualResultado = await client.query(
+      `
+      SELECT
+        id_lote,
+        id_sucursal,
+        id_producto,
+        id_proveedor,
+        lote,
+        fecha_caducidad,
+        stock_actual,
+        precio_compra,
+        activo
+      FROM inventario_lotes
+      WHERE id_lote = $1
+      FOR UPDATE
+      `,
+      [id_lote]
+    );
+
+    if (loteActualResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'El lote no existe',
+      });
+    }
+
+    const loteActual = loteActualResultado.rows[0];
+    const loteNormalizado = normalizarLote(lote);
+
+    const loteDuplicado = await client.query(
+      `
+      SELECT id_lote
+      FROM inventario_lotes
+      WHERE id_sucursal = $1
+        AND id_producto = $2
+        AND lote = $3
+        AND (
+          (fecha_caducidad = $4::date)
+          OR (fecha_caducidad IS NULL AND $4::date IS NULL)
+        )
+        AND id_lote <> $5
+      LIMIT 1
+      `,
+      [
+        loteActual.id_sucursal,
+        loteActual.id_producto,
+        loteNormalizado,
+        fecha_caducidad || null,
+        id_lote,
+      ]
+    );
+
+    if (loteDuplicado.rows.length > 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(409).json({
+        ok: false,
+        mensaje: 'Ya existe otro lote con el mismo número y fecha de caducidad para este producto',
+      });
+    }
+
+    const loteActualizadoResultado = await client.query(
+      `
+      UPDATE inventario_lotes
+      SET
+        id_proveedor = $1,
+        lote = $2,
+        fecha_caducidad = $3,
+        precio_compra = $4,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_lote = $5
+      RETURNING *
+      `,
+      [
+        id_proveedor ? Number(id_proveedor) : null,
+        loteNormalizado,
+        fecha_caducidad || null,
+        precio_compra !== '' && precio_compra !== null && precio_compra !== undefined
+          ? Number(precio_compra)
+          : 0,
+        id_lote,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      mensaje: 'Lote actualizado correctamente',
+      lote: loteActualizadoResultado.rows[0],
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Error al actualizar lote:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al actualizar el lote',
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+};
+
 export const listarCaducidadProxima = async (req, res) => {
   try {
     const { sucursal, dias = 90 } = req.query;

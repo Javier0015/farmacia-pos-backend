@@ -1,4 +1,5 @@
 import { Router } from 'express';
+
 import {
   listarInventarioPorSucursal,
   listarBajoStock,
@@ -6,6 +7,7 @@ import {
   ajustarInventario,
   listarMovimientosInventario,
   listarLotesProducto,
+  actualizarLote,
   listarCaducidadProxima,
   bajaLotePorCaducidad,
   consultarStockSucursales,
@@ -20,11 +22,12 @@ router.get('/bajo-stock', verificarToken, listarBajoStock);
 router.get('/movimientos', verificarToken, listarMovimientosInventario);
 router.get('/lotes', verificarToken, listarLotesProducto);
 router.get('/caducidad-proxima', verificarToken, listarCaducidadProxima);
+router.get('/stock-sucursales', verificarToken, consultarStockSucursales);
 
 router.post('/asignar', verificarToken, asignarInventario);
 router.post('/ajustar', verificarToken, ajustarInventario);
 router.post('/baja-caducidad', verificarToken, bajaLotePorCaducidad);
 
-router.get('/stock-sucursales', verificarToken, consultarStockSucursales);
+router.put('/lotes/:id_lote', verificarToken, actualizarLote);
 
 export default router;
