@@ -1,4 +1,4 @@
-import dotenv from 'dotenv';
+/*import dotenv from 'dotenv';
 import app from './app.js';
 import pool from './config/db.js';
 
@@ -23,7 +23,7 @@ const iniciarServidor = async () => {
 };
 
 iniciarServidor();
-/*
+*/
 
 import dotenv from 'dotenv';
 import app from './app.js';
@@ -44,4 +44,3 @@ const iniciarServidor = async () => {
 
 iniciarServidor();
 
-*/

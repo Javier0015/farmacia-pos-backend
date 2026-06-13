@@ -41,6 +41,391 @@ const esValorActivo = (valor) => {
   return valor === true || valor === 'true' || valor === 1 || valor === '1';
 };
 
+const limpiarTexto = (valor) => {
+  const texto = String(valor ?? '').trim();
+  return texto.length > 0 ? texto : null;
+};
+
+const normalizarFechaSQL = (valor) => {
+  const texto = limpiarTexto(valor);
+  if (!texto) return null;
+
+  const fecha = new Date(texto);
+  if (Number.isNaN(fecha.getTime())) return null;
+
+  return texto;
+};
+
+const normalizarNumeroPositivo = (valor) => {
+  const numero = Number(valor || 0);
+  if (Number.isNaN(numero) || numero < 0) return 0;
+  return redondearDos(numero);
+};
+
+const calcularTipoSurtidoExterno = ({ cantidadRecetada, cantidadSurtida }) => {
+  if (cantidadRecetada <= 0 || cantidadSurtida <= 0) return null;
+  return cantidadSurtida >= cantidadRecetada ? 'COMPLETO' : 'PARCIAL';
+};
+
+const obtenerDatosControlSanitarioShaddai = async ({
+  client,
+  item,
+  cantidadVenta,
+}) => {
+  if (!item.id_receta_shaddai || !item.id_detalle_receta_shaddai) {
+    return null;
+  }
+
+  /**
+   * Primero consultamos la receta y su detalle.
+   * Esto evita depender de datos temporales enviados desde el frontend.
+   */
+  const recetaResultado = await client.query(
+    `
+    SELECT
+      r.id_receta,
+      r.id_doctor,
+      r.folio_receta,
+      r.nombre_paciente,
+      r.telefono_paciente,
+      r.fecha_creacion AS fecha_receta,
+      r.observaciones AS observaciones_receta,
+
+      d.id_detalle,
+      d.cantidad AS cantidad_recetada,
+      d.cantidad_surtida,
+      d.dosis,
+      d.frecuencia,
+      d.duracion,
+      d.indicaciones
+    FROM recetas_shaddai r
+    INNER JOIN recetas_shaddai_detalle d
+      ON d.id_receta = r.id_receta
+    WHERE r.id_receta = $1
+      AND d.id_detalle = $2
+      AND r.activo = true
+      AND d.activo = true
+    LIMIT 1
+    `,
+    [
+      Number(item.id_receta_shaddai),
+      Number(item.id_detalle_receta_shaddai),
+    ]
+  );
+
+  if (recetaResultado.rows.length === 0) {
+    throw new Error(
+      `No se encontró la receta Doctor Shaddai #${item.id_receta_shaddai} o su detalle #${item.id_detalle_receta_shaddai}.`
+    );
+  }
+
+  const receta = recetaResultado.rows[0];
+
+  let medicoNombre = 'Doctor Shaddai';
+  let medicoCedula = null;
+
+  /**
+   * La columna de cédula puede variar según tu tabla:
+   * cedula_profesional, cedula, cedula_medico, no_cedula, etc.
+   * Por eso detectamos primero las columnas disponibles y armamos una
+   * consulta segura sin romper si alguna columna no existe.
+   */
+  if (receta.id_doctor) {
+    const columnasDoctorResultado = await client.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'doctores_shaddai_perfiles'
+      `
+    );
+
+    const columnasDoctor = columnasDoctorResultado.rows.map((row) =>
+      String(row.column_name)
+    );
+
+    const columnaNombre =
+      columnasDoctor.includes('nombre_completo')
+        ? 'nombre_completo'
+        : columnasDoctor.includes('nombre')
+          ? 'nombre'
+          : null;
+
+    const columnaCedula =
+      columnasDoctor.includes('cedula_profesional')
+        ? 'cedula_profesional'
+        : columnasDoctor.includes('cedula')
+          ? 'cedula'
+          : columnasDoctor.includes('cedula_medico')
+            ? 'cedula_medico'
+            : columnasDoctor.includes('no_cedula')
+              ? 'no_cedula'
+              : columnasDoctor.includes('numero_cedula')
+                ? 'numero_cedula'
+                : null;
+
+    const selects = [
+      'id_perfil',
+      columnaNombre ? `${columnaNombre} AS medico_nombre` : `NULL::varchar AS medico_nombre`,
+      columnaCedula ? `${columnaCedula} AS medico_cedula` : `NULL::varchar AS medico_cedula`,
+    ];
+
+    const selectDoctorSql = selects.join(',\n        ');
+
+    const doctorResultado = await client.query(
+      `
+      SELECT
+        ${selectDoctorSql}
+      FROM doctores_shaddai_perfiles
+      WHERE id_perfil = $1
+         OR id_usuario = $1
+      LIMIT 1
+      `,
+      [receta.id_doctor]
+    );
+
+    if (doctorResultado.rows.length > 0) {
+      medicoNombre =
+        limpiarTexto(doctorResultado.rows[0].medico_nombre) ||
+        medicoNombre;
+
+      medicoCedula =
+        limpiarTexto(doctorResultado.rows[0].medico_cedula) ||
+        null;
+    }
+  }
+
+  const cantidadRecetada = normalizarNumeroPositivo(
+    receta.cantidad_recetada || cantidadVenta
+  );
+
+  const cantidadSurtidaPrevia = normalizarNumeroPositivo(
+    receta.cantidad_surtida || 0
+  );
+
+  const cantidadSurtidaActual = normalizarNumeroPositivo(cantidadVenta);
+
+  const totalSurtido = redondearDos(
+    cantidadSurtidaPrevia + cantidadSurtidaActual
+  );
+
+  const cantidadPendiente = Math.max(
+    redondearDos(cantidadRecetada - totalSurtido),
+    0
+  );
+
+  return {
+    tipo_receta: 'SHADDAI',
+
+    numero_receta:
+      receta.folio_receta ||
+      `SHADDAI-${receta.id_receta}`,
+
+    fecha_receta: receta.fecha_receta || null,
+
+    medico_nombre: medicoNombre,
+    medico_cedula: medicoCedula,
+
+    paciente_nombre:
+      limpiarTexto(receta.nombre_paciente) ||
+      'Paciente Doctor Shaddai',
+
+    paciente_telefono:
+      limpiarTexto(receta.telefono_paciente) ||
+      null,
+
+    cantidad_recetada: cantidadRecetada,
+    cantidad_surtida: cantidadSurtidaActual,
+    cantidad_pendiente: cantidadPendiente,
+
+    tipo_surtido: cantidadPendiente === 0 ? 'COMPLETO' : 'PARCIAL',
+
+    observaciones:
+      limpiarTexto(receta.observaciones_receta) ||
+      `Venta vinculada a receta Doctor Shaddai ${receta.folio_receta || receta.id_receta}`,
+  };
+};
+
+const validarDatosControlSanitario = ({ productoDb, item, cantidadVenta }) => {
+  const requiereControl =
+    esValorActivo(productoDb.controlado) ||
+    esValorActivo(productoDb.es_controlado) ||
+    esValorActivo(productoDb.requiere_receta);
+
+  if (!requiereControl) return null;
+
+  const esRecetaShaddai =
+    item.id_receta_shaddai && item.id_detalle_receta_shaddai;
+
+  /**
+   * Doctor Shaddai se resuelve con obtenerDatosControlSanitarioShaddai(),
+   * consultando directamente recetas_shaddai y recetas_shaddai_detalle.
+   * Aquí no exigimos datos de receta externa.
+   */
+  if (esRecetaShaddai) return null;
+
+  const datos = item.datos_control_sanitario || null;
+
+  if (!datos) {
+    throw new Error(
+      `El producto ${productoDb.nombre} requiere datos de control sanitario.`
+    );
+  }
+
+  const numeroReceta = limpiarTexto(datos.numero_receta);
+  const medicoNombre = limpiarTexto(datos.medico_nombre);
+  const medicoCedula = limpiarTexto(datos.medico_cedula);
+  const pacienteNombre = limpiarTexto(datos.paciente_nombre);
+
+  if (!numeroReceta) {
+    throw new Error(`El número de receta es obligatorio para ${productoDb.nombre}.`);
+  }
+
+  if (!medicoNombre) {
+    throw new Error(`El nombre del médico es obligatorio para ${productoDb.nombre}.`);
+  }
+
+  if (!medicoCedula) {
+    throw new Error(`La cédula profesional del médico es obligatoria para ${productoDb.nombre}.`);
+  }
+
+  if (!pacienteNombre) {
+    throw new Error(`El nombre del paciente es obligatorio para ${productoDb.nombre}.`);
+  }
+
+  const tipoReceta = limpiarTexto(datos.tipo_receta) || 'EXTERNA';
+
+  const cantidadRecetada = normalizarNumeroPositivo(datos.cantidad_recetada);
+  const cantidadSurtida = normalizarNumeroPositivo(
+    datos.cantidad_surtida || cantidadVenta
+  );
+
+  if (tipoReceta === 'EXTERNA') {
+    if (cantidadRecetada <= 0) {
+      throw new Error(
+        `La cantidad indicada en receta es obligatoria para ${productoDb.nombre}.`
+      );
+    }
+
+    if (cantidadSurtida <= 0) {
+      throw new Error(
+        `La cantidad a surtir es obligatoria para ${productoDb.nombre}.`
+      );
+    }
+
+    if (cantidadSurtida > cantidadRecetada) {
+      throw new Error(
+        `No puedes surtir más de lo indicado en receta para ${productoDb.nombre}.`
+      );
+    }
+
+    if (Number(cantidadVenta) !== Number(cantidadSurtida)) {
+      throw new Error(
+        `La cantidad vendida de ${productoDb.nombre} no coincide con la cantidad a surtir capturada.`
+      );
+    }
+  }
+
+  const cantidadPendiente = Math.max(
+    redondearDos(cantidadRecetada - cantidadSurtida),
+    0
+  );
+
+  return {
+    tipo_receta: tipoReceta,
+    numero_receta: numeroReceta,
+    fecha_receta: normalizarFechaSQL(datos.fecha_receta),
+    medico_nombre: medicoNombre,
+    medico_cedula: medicoCedula,
+    paciente_nombre: pacienteNombre,
+    paciente_telefono: limpiarTexto(datos.paciente_telefono),
+
+    cantidad_recetada: cantidadRecetada > 0 ? cantidadRecetada : null,
+    cantidad_surtida: cantidadSurtida > 0 ? cantidadSurtida : Number(cantidadVenta),
+    cantidad_pendiente: cantidadRecetada > 0 ? cantidadPendiente : null,
+    tipo_surtido:
+      limpiarTexto(datos.tipo_surtido) ||
+      calcularTipoSurtidoExterno({ cantidadRecetada, cantidadSurtida }),
+
+    observaciones: limpiarTexto(datos.observaciones),
+  };
+};
+
+const registrarLibroControlSanitario = async ({
+  client,
+  idVenta,
+  idDetalleVenta,
+  idProducto,
+  idLote,
+  idSucursal,
+  tipoMovimiento = 'SALIDA',
+  cantidadEntrada = 0,
+  cantidadSalida = 0,
+  existenciaDespues,
+  datosControl,
+  idUsuario,
+}) => {
+  if (!datosControl) return;
+
+  await client.query(
+    `
+    INSERT INTO libro_control_sanitario (
+      id_venta,
+      id_detalle_venta,
+      id_producto,
+      id_lote,
+      id_sucursal,
+      tipo_movimiento,
+      cantidad_entrada,
+      cantidad_salida,
+      existencia_despues,
+      tipo_receta,
+      numero_receta,
+      fecha_receta,
+      medico_nombre,
+      medico_cedula,
+      paciente_nombre,
+      paciente_telefono,
+      cantidad_recetada,
+      cantidad_surtida,
+      cantidad_pendiente,
+      tipo_surtido,
+      observaciones,
+      id_usuario
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,
+      $6,$7,$8,$9,
+      $10,$11,$12,$13,$14,$15,$16,
+      $17,$18,$19,$20,$21,$22
+    )
+    `,
+    [
+      idVenta,
+      idDetalleVenta,
+      idProducto,
+      idLote,
+      idSucursal,
+      tipoMovimiento,
+      redondearDos(cantidadEntrada || 0),
+      redondearDos(cantidadSalida || 0),
+      existenciaDespues ?? null,
+      datosControl.tipo_receta || 'EXTERNA',
+      datosControl.numero_receta,
+      datosControl.fecha_receta,
+      datosControl.medico_nombre,
+      datosControl.medico_cedula,
+      datosControl.paciente_nombre,
+      datosControl.paciente_telefono,
+      datosControl.cantidad_recetada,
+      datosControl.cantidad_surtida,
+      datosControl.cantidad_pendiente,
+      datosControl.tipo_surtido,
+      datosControl.observaciones,
+      idUsuario,
+    ]
+  );
+};
 
 const METODOS_PAGO_PERMITIDOS = [
   'EFECTIVO',
@@ -666,20 +1051,24 @@ export const crearVenta = async (req, res) => {
         });
       }
 
-      const productoResultado = await client.query(
-        `
-        SELECT 
-          id_producto,
-          id_categoria,
-          nombre,
-          precio_venta,
-          activo
-        FROM productos
-        WHERE id_producto = $1
-          AND activo = true
-        `,
-        [id_producto]
-      );
+const productoResultado = await client.query(
+  `
+  SELECT 
+    id_producto,
+    id_categoria,
+    nombre,
+    precio_venta,
+    activo,
+    es_controlado AS controlado,
+    requiere_receta,
+    NULL::varchar AS fraccion_control,
+    NULL::varchar AS tipo_control_sanitario
+  FROM productos
+  WHERE id_producto = $1
+    AND activo = true
+  `,
+  [id_producto]
+);
 
       if (productoResultado.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -691,6 +1080,41 @@ export const crearVenta = async (req, res) => {
       }
 
       const producto = productoResultado.rows[0];
+
+      let datosControlSanitario = null;
+
+      try {
+        const esRecetaShaddai =
+          item.id_receta_shaddai && item.id_detalle_receta_shaddai;
+
+        if (
+          esRecetaShaddai &&
+          (
+            esValorActivo(producto.controlado) ||
+            esValorActivo(producto.es_controlado) ||
+            esValorActivo(producto.requiere_receta)
+          )
+        ) {
+          datosControlSanitario = await obtenerDatosControlSanitarioShaddai({
+            client,
+            item,
+            cantidadVenta: Number(cantidad),
+          });
+        } else {
+          datosControlSanitario = validarDatosControlSanitario({
+            productoDb: producto,
+            item,
+            cantidadVenta: Number(cantidad),
+          });
+        }
+      } catch (error) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: error.message,
+        });
+      }
 
       const inventarioResultado = await client.query(
         `
@@ -897,6 +1321,10 @@ export const crearVenta = async (req, res) => {
         id_detalle_receta_shaddai: item.id_detalle_receta_shaddai
           ? Number(item.id_detalle_receta_shaddai)
           : null,
+
+        controlado: esValorActivo(producto.controlado),
+        requiere_receta: esValorActivo(producto.requiere_receta),
+        datos_control_sanitario: datosControlSanitario,
       });
     }
 
@@ -1267,7 +1695,7 @@ export const crearVenta = async (req, res) => {
     }
 
     for (const item of productosProcesados) {
-      await client.query(
+      const detalleVentaResultado = await client.query(
         `
         INSERT INTO venta_detalle (
           id_venta,
@@ -1287,6 +1715,7 @@ export const crearVenta = async (req, res) => {
         VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
         )
+        RETURNING id_detalle
         `,
         [
           venta.id_venta,
@@ -1304,6 +1733,28 @@ export const crearVenta = async (req, res) => {
           item.id_detalle_receta_shaddai,
         ]
       );
+
+      const idDetalleVenta = detalleVentaResultado.rows[0].id_detalle;
+
+      if (item.datos_control_sanitario) {
+        const loteControl = item.lotes_descontados?.[0] || null;
+
+        await registrarLibroControlSanitario({
+          client,
+          idVenta: venta.id_venta,
+          idDetalleVenta,
+          idProducto: item.id_producto,
+          idLote: item.id_lote || loteControl?.id_lote || null,
+          idSucursal: id_sucursal,
+          tipoMovimiento: 'SALIDA',
+          cantidadEntrada: 0,
+          cantidadSalida: item.cantidad,
+          existenciaDespues:
+            loteControl?.stock_lote_nuevo ?? item.stock_nuevo ?? null,
+          datosControl: item.datos_control_sanitario,
+          idUsuario: req.usuario.id_usuario,
+        });
+      }
 
       if (item.id_receta_shaddai && item.id_detalle_receta_shaddai) {
         await client.query(
@@ -1933,12 +2384,51 @@ export const obtenerVenta = async (req, res) => {
       [ventaResultado.rows[0].folio]
     );
 
+    const controlSanitarioResultado = await pool.query(
+      `
+      SELECT
+        lcs.id_movimiento,
+        lcs.id_venta,
+        lcs.id_detalle_venta,
+        lcs.id_producto,
+        p.nombre AS producto,
+        lcs.id_lote,
+        il.lote,
+        il.fecha_caducidad,
+        lcs.tipo_movimiento,
+        lcs.cantidad_entrada,
+        lcs.cantidad_salida,
+        lcs.existencia_despues,
+        lcs.tipo_receta,
+        lcs.numero_receta,
+        lcs.fecha_receta,
+        lcs.medico_nombre,
+        lcs.medico_cedula,
+        lcs.paciente_nombre,
+        lcs.paciente_telefono,
+        lcs.cantidad_recetada,
+        lcs.cantidad_surtida,
+        lcs.cantidad_pendiente,
+        lcs.tipo_surtido,
+        lcs.observaciones,
+        lcs.estatus,
+        lcs.fecha_registro
+      FROM libro_control_sanitario lcs
+      INNER JOIN productos p ON p.id_producto = lcs.id_producto
+      LEFT JOIN inventario_lotes il ON il.id_lote = lcs.id_lote
+      WHERE lcs.id_venta = $1
+      ORDER BY lcs.fecha_registro ASC, lcs.id_movimiento ASC
+      `,
+      [id]
+    );
+
     return res.json({
       ok: true,
       venta: ventaResultado.rows[0],
       detalle: detalleResultado.rows,
       pagos: pagosResultado.rows,
       lotes: lotesResultado.rows,
+      control_sanitario: controlSanitarioResultado.rows,
     });
   } catch (error) {
     console.error('Error al obtener venta:', error);
@@ -2390,6 +2880,54 @@ export const devolverVenta = async (req, res) => {
             req.usuario.id_usuario,
           ]
         );
+
+        const controlOriginalResultado = await client.query(
+          `
+          SELECT
+            tipo_receta,
+            numero_receta,
+            fecha_receta,
+            medico_nombre,
+            medico_cedula,
+            paciente_nombre,
+            paciente_telefono,
+            cantidad_recetada,
+            cantidad_surtida,
+            cantidad_pendiente,
+            tipo_surtido,
+            observaciones
+          FROM libro_control_sanitario
+          WHERE id_venta = $1
+            AND id_producto = $2
+            AND id_lote IS NOT DISTINCT FROM $3
+            AND tipo_movimiento = 'SALIDA'
+          ORDER BY id_movimiento ASC
+          LIMIT 1
+          `,
+          [venta.id_venta, detalle.id_producto, loteVenta.id_lote]
+        );
+
+        if (controlOriginalResultado.rows.length > 0) {
+          const controlOriginal = controlOriginalResultado.rows[0];
+
+          await registrarLibroControlSanitario({
+            client,
+            idVenta: venta.id_venta,
+            idDetalleVenta: detalle.id_detalle,
+            idProducto: detalle.id_producto,
+            idLote: loteVenta.id_lote,
+            idSucursal: venta.id_sucursal,
+            tipoMovimiento: 'CANCELACION',
+            cantidadEntrada: cantidadARestituir,
+            cantidadSalida: 0,
+            existenciaDespues: stockLoteNuevo,
+            datosControl: {
+              ...controlOriginal,
+              observaciones: `Cancelación/devolución ${folioDevolucion} de venta ${venta.folio}. ${controlOriginal.observaciones || ''}`.trim(),
+            },
+            idUsuario: req.usuario.id_usuario,
+          });
+        }
 
         cantidadPendienteRestituir = redondearDos(
           cantidadPendienteRestituir - cantidadARestituir

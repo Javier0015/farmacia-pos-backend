@@ -33,21 +33,21 @@ import referenciasRoutes from './routes/referencias.routes.js';
 import violenciaLesionRoutes from './routes/violenciaLesion.routes.js';
 import consentimientosRoutes from './routes/consentimientos.routes.js';
 import documentosClinicosRoutes from './routes/documentosClinicos.routes.js';
+import controlSanitarioRoutes from './routes/controlSanitario.routes.js';
+
 
 const app = express();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Middlewares
+
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 app.use(morgan('dev'));
 
-// Archivos públicos subidos
-// Ruta física: backend/uploads
-// URL pública: https://tu-backend.onrender.com/uploads/...
+
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Ruta inicial
@@ -68,41 +68,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Ruta temporal para revisar si Render ya tomó el deploy correcto
-app.get('/api/debug-rutas', (req, res) => {
-  res.json({
-    ok: true,
-    mensaje: 'Debug de rutas activo',
-    backend: 'farmacia-pos-backend',
-    fecha: new Date(),
-    rutas_importantes: {
-      health: '/api/health',
-      auth: '/api/auth',
-      sucursales: '/api/sucursales',
-      productos: '/api/productos',
-      inventario: '/api/inventario',
-      caja: '/api/caja',
-      ventas: '/api/ventas',
-      doctor_shaddai: {
-        base: '/api/doctor-shaddai',
-        mi_perfil: '/api/doctor-shaddai/mi-perfil',
-        expedientes: '/api/doctor-shaddai/expedientes',
-        recetas: '/api/doctor-shaddai/recetas',
-        receta_por_id: '/api/doctor-shaddai/recetas/:id',
-        cancelar_receta: '/api/doctor-shaddai/recetas/:id/cancelar',
-        surtir_receta: '/api/doctor-shaddai/recetas/:id/surtir',
-        nota_medica: '/api/doctor-shaddai/notas-medicas/:idNota',
-      },
-      doctor_fila: '/api/doctor-fila',
-      laboratorio: '/api/laboratorio',
-      notas_medicas: '/api/notas-medicas',
-      referencias: '/api/referencias',
-      violencia_lesion: '/api/violencia-lesion',
-      consentimientos: '/api/consentimientos',
-      documentos_clinicos: '/api/documentos-clinicos',
-    },
-  });
-});
 
 // Rutas principales
 app.use('/api/auth', authRoutes);
@@ -134,6 +99,7 @@ app.use('/api/referencias', referenciasRoutes);
 app.use('/api/violencia-lesion', violenciaLesionRoutes);
 app.use('/api/consentimientos', consentimientosRoutes);
 app.use('/api/documentos-clinicos', documentosClinicosRoutes);
+app.use('/api/control-sanitario', controlSanitarioRoutes);
 
 // Middleware para rutas no encontradas
 app.use((req, res) => {

@@ -107,22 +107,28 @@ export const obtenerResumenDashboard = async (req, res) => {
 
     const bajoStock = await pool.query(
       `
-      SELECT COUNT(*)::INT AS total_bajo_stock
-      FROM inventario_sucursal
-      WHERE id_sucursal = $1
-        AND stock_actual <= stock_minimo
+    SELECT COUNT(*)::INT AS total_bajo_stock
+    FROM inventario_sucursal AS i
+    JOIN productos AS p 
+      ON p.id_producto = i.id_producto
+    WHERE p.activo = true
+      AND i.id_sucursal = $1
+      AND i.stock_actual <= i.stock_minimo;
       `,
       [sucursal]
     );
 
     const caducidad = await pool.query(
       `
-      SELECT COUNT(*)::INT AS total_caducidad
-      FROM inventario_lotes
-      WHERE id_sucursal = $1
-        AND stock_actual > 0
-        AND fecha_caducidad IS NOT NULL
-        AND fecha_caducidad <= CURRENT_DATE + INTERVAL '90 days'
+    SELECT COUNT(*)::INT AS total_caducidad
+FROM inventario_lotes AS il
+JOIN productos AS p
+  ON p.id_producto = il.id_producto
+WHERE p.activo = true
+  AND il.id_sucursal = $1
+  AND il.stock_actual > 0
+  AND il.fecha_caducidad IS NOT NULL
+  AND il.fecha_caducidad <= CURRENT_DATE + INTERVAL '90 days';
       `,
       [sucursal]
     );
