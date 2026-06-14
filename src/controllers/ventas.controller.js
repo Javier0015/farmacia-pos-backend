@@ -838,7 +838,8 @@ export const crearVenta = async (req, res) => {
       pagos = [],
       descuento = 0,
       impuesto = 0,
-      productos,
+      productos = [],
+      servicios = [],
       id_tarjeta_puntos,
       id_doctor,
       id_receta_shaddai,
@@ -851,10 +852,13 @@ export const crearVenta = async (req, res) => {
       });
     }
 
-    if (!Array.isArray(productos) || productos.length === 0) {
+    const productosVenta = Array.isArray(productos) ? productos : [];
+    const serviciosVenta = Array.isArray(servicios) ? servicios : [];
+
+    if (productosVenta.length === 0 && serviciosVenta.length === 0) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'La venta debe contener al menos un producto',
+        mensaje: 'La venta debe contener al menos un producto o servicio',
       });
     }
 
@@ -957,11 +961,18 @@ export const crearVenta = async (req, res) => {
 
     let doctorShaddaiVenta = null;
 
+    const productoConRecetaShaddai = productosVenta.find((item) => item.id_receta_shaddai);
+
     const idRecetaShaddaiVenta = id_receta_shaddai
       ? Number(id_receta_shaddai)
-      : productos.find((item) => item.id_receta_shaddai)?.id_receta_shaddai
-        ? Number(productos.find((item) => item.id_receta_shaddai)?.id_receta_shaddai)
+      : productoConRecetaShaddai?.id_receta_shaddai
+        ? Number(productoConRecetaShaddai.id_receta_shaddai)
         : null;
+
+    const servicioClinicoVenta = serviciosVenta.find((item) => item.id_solicitud_servicio);
+    const idSolicitudServicioVenta = servicioClinicoVenta?.id_solicitud_servicio
+      ? Number(servicioClinicoVenta.id_solicitud_servicio)
+      : null;
 
     let idDoctorVenta = id_doctor ? Number(id_doctor) : null;
 
@@ -980,6 +991,25 @@ export const crearVenta = async (req, res) => {
       if (recetaDoctorResultado.rows.length > 0) {
         idDoctorVenta = recetaDoctorResultado.rows[0].id_doctor
           ? Number(recetaDoctorResultado.rows[0].id_doctor)
+          : null;
+      }
+    }
+
+    if (!idDoctorVenta && idSolicitudServicioVenta) {
+      const servicioDoctorResultado = await client.query(
+        `
+        SELECT
+          id_doctor
+        FROM servicios_clinicos_solicitudes
+        WHERE id_solicitud_servicio = $1
+        LIMIT 1
+        `,
+        [idSolicitudServicioVenta]
+      );
+
+      if (servicioDoctorResultado.rows.length > 0) {
+        idDoctorVenta = servicioDoctorResultado.rows[0].id_doctor
+          ? Number(servicioDoctorResultado.rows[0].id_doctor)
           : null;
       }
     }
@@ -1036,8 +1066,9 @@ export const crearVenta = async (req, res) => {
     let recetaShaddaiActualizada = null;
 
     const productosProcesados = [];
+    const serviciosProcesados = [];
 
-    for (const item of productos) {
+    for (const item of productosVenta) {
       const { id_producto, cantidad } = item;
       const idLoteSeleccionado = item.id_lote ? Number(item.id_lote) : null;
 
@@ -1325,6 +1356,129 @@ const productoResultado = await client.query(
         controlado: esValorActivo(producto.controlado),
         requiere_receta: esValorActivo(producto.requiere_receta),
         datos_control_sanitario: datosControlSanitario,
+      });
+    }
+
+    for (const item of serviciosVenta) {
+      const idSolicitudServicio = item.id_solicitud_servicio
+        ? Number(item.id_solicitud_servicio)
+        : null;
+
+      const idDetalleServicio = item.id_detalle_servicio
+        ? Number(item.id_detalle_servicio)
+        : null;
+
+      if (!idSolicitudServicio || !idDetalleServicio) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'Cada servicio debe tener id_solicitud_servicio e id_detalle_servicio',
+        });
+      }
+
+      const servicioResultado = await client.query(
+        `
+        SELECT
+          s.id_solicitud_servicio,
+          s.folio_servicio,
+          s.nombre_paciente,
+          s.id_doctor,
+          s.estatus,
+          s.activo AS solicitud_activa,
+
+          sd.id_detalle_servicio,
+          sd.id_servicio,
+          sd.id_producto,
+          sd.nombre_servicio,
+          sd.cantidad,
+          sd.precio_unitario,
+          sd.subtotal,
+          sd.activo AS detalle_activo
+        FROM servicios_clinicos_solicitudes s
+        INNER JOIN servicios_clinicos_solicitudes_detalle sd
+          ON sd.id_solicitud_servicio = s.id_solicitud_servicio
+        WHERE s.id_solicitud_servicio = $1
+          AND sd.id_detalle_servicio = $2
+        FOR UPDATE OF s, sd
+        `,
+        [idSolicitudServicio, idDetalleServicio]
+      );
+
+      if (servicioResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: `No se encontró el servicio clínico ${idSolicitudServicio}.`,
+        });
+      }
+
+      const servicioDb = servicioResultado.rows[0];
+
+      if (!esValorActivo(servicioDb.solicitud_activa) || !esValorActivo(servicioDb.detalle_activo)) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `El servicio ${servicioDb.nombre_servicio} está inactivo.`,
+        });
+      }
+
+      const estatusServicio = String(servicioDb.estatus || '').toUpperCase();
+
+      if (estatusServicio !== 'PENDIENTE_CAJERO') {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `El servicio ${servicioDb.folio_servicio || idSolicitudServicio} no está pendiente de caja.`,
+        });
+      }
+
+      const cantidadServicio = normalizarNumeroPositivo(
+        item.cantidad ?? servicioDb.cantidad ?? 1
+      );
+
+      const precioUnitarioServicio = redondearDos(
+        item.precio_unitario ?? servicioDb.precio_unitario ?? 0
+      );
+
+      if (cantidadServicio <= 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `La cantidad del servicio ${servicioDb.nombre_servicio} debe ser mayor a cero.`,
+        });
+      }
+
+      if (precioUnitarioServicio < 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `El precio del servicio ${servicioDb.nombre_servicio} no puede ser negativo.`,
+        });
+      }
+
+      const subtotalServicio = redondearDos(cantidadServicio * precioUnitarioServicio);
+
+      subtotalVenta += subtotalServicio;
+      subtotalSinDescuentoVenta += subtotalServicio;
+
+      serviciosProcesados.push({
+        id_solicitud_servicio: servicioDb.id_solicitud_servicio,
+        id_detalle_servicio: servicioDb.id_detalle_servicio,
+        id_servicio: servicioDb.id_servicio,
+        id_producto: servicioDb.id_producto || null,
+        folio_servicio: servicioDb.folio_servicio,
+        nombre_paciente: servicioDb.nombre_paciente,
+        nombre_servicio: servicioDb.nombre_servicio,
+        cantidad: cantidadServicio,
+        precio_unitario: precioUnitarioServicio,
+        subtotal: subtotalServicio,
+        id_doctor: servicioDb.id_doctor || null,
       });
     }
 
@@ -1680,7 +1834,7 @@ const productoResultado = await client.query(
               null,
               venta.id_venta,
               puntosDoctorShaddaiGanados,
-              `Puntos generados por venta ${folio} | Doctor Shaddai ${doctorShaddaiVenta.nombre_completo} | Receta Shaddai #${idRecetaShaddaiVenta || 'N/A'} | ${porcentajeDoctor}% sobre $${totalVenta.toFixed(2)}`,
+              `Puntos generados por venta ${folio} | Doctor Shaddai ${doctorShaddaiVenta.nombre_completo} | Receta Shaddai #${idRecetaShaddaiVenta || 'N/A'} | Servicio clínico #${idSolicitudServicioVenta || 'N/A'} | ${porcentajeDoctor}% sobre $${totalVenta.toFixed(2)}`,
             ]
           );
 
@@ -1807,6 +1961,73 @@ const productoResultado = await client.query(
           ]
         );
       }
+    }
+
+    for (const item of serviciosProcesados) {
+      await client.query(
+        `
+        INSERT INTO venta_servicios_detalle (
+          id_venta,
+          id_solicitud_servicio,
+          id_detalle_servicio,
+          id_servicio,
+          nombre_servicio,
+          cantidad,
+          precio_unitario,
+          subtotal,
+          folio_servicio,
+          nombre_paciente
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        `,
+        [
+          venta.id_venta,
+          item.id_solicitud_servicio,
+          item.id_detalle_servicio,
+          item.id_servicio,
+          item.nombre_servicio,
+          item.cantidad,
+          item.precio_unitario,
+          item.subtotal,
+          item.folio_servicio,
+          item.nombre_paciente,
+        ]
+      );
+    }
+
+    const solicitudesServiciosVendidas = [
+      ...new Set(
+        serviciosProcesados
+          .map((item) => item.id_solicitud_servicio)
+          .filter(Boolean)
+      ),
+    ];
+
+    for (const idSolicitudServicio of solicitudesServiciosVendidas) {
+      await client.query(
+        `
+        UPDATE servicios_clinicos_solicitudes
+        SET
+          estatus = 'PAGADO',
+          fecha_pago = CURRENT_TIMESTAMP,
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE id_solicitud_servicio = $1
+          AND estatus = 'PENDIENTE_CAJERO'
+        `,
+        [idSolicitudServicio]
+      );
+
+      await client.query(
+        `
+        UPDATE documentos_clinicos
+        SET
+          estatus = 'PAGADO',
+          fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE tabla_origen = 'servicios_clinicos_solicitudes'
+          AND id_origen = $1
+        `,
+        [idSolicitudServicio]
+      );
     }
 
     const recetasShaddaiVendidas = [
@@ -1998,6 +2219,7 @@ const productoResultado = await client.query(
       venta: {
         ...venta,
         productos: productosProcesados,
+        servicios: serviciosProcesados,
         pagos: pagosVenta,
         tarjeta_puntos: tarjetaActualizada,
         doctor_shaddai_puntos: doctorShaddaiPuntos,
@@ -3037,5 +3259,178 @@ export const devolverVenta = async (req, res) => {
     });
   } finally {
     client.release();
+  }
+};
+
+
+export const listarVentasServiciosClinicos = async (req, res) => {
+  try {
+    const {
+      sucursal,
+      fecha_inicio,
+      fecha_fin,
+      busqueda,
+      estado = 'COMPLETADA',
+    } = req.query;
+
+    const params = [];
+
+    let where = `
+      WHERE 1 = 1
+    `;
+
+    if (estado && String(estado).toUpperCase() !== 'TODOS') {
+      params.push(String(estado).toUpperCase());
+      where += ` AND v.estado = $${params.length} `;
+    }
+
+    if (sucursal) {
+      params.push(Number(sucursal));
+      where += ` AND v.id_sucursal = $${params.length} `;
+    }
+
+    if (fecha_inicio) {
+      params.push(fecha_inicio);
+      where += ` AND v.fecha_venta::date >= $${params.length}::date `;
+    }
+
+    if (fecha_fin) {
+      params.push(fecha_fin);
+      where += ` AND v.fecha_venta::date <= $${params.length}::date `;
+    }
+
+    if (busqueda && String(busqueda).trim()) {
+      params.push(`%${String(busqueda).trim()}%`);
+      where += `
+        AND (
+          v.folio ILIKE $${params.length}
+          OR vsd.folio_servicio ILIKE $${params.length}
+          OR vsd.nombre_paciente ILIKE $${params.length}
+          OR vsd.nombre_servicio ILIKE $${params.length}
+          OR COALESCE(scs.diagnostico, '') ILIKE $${params.length}
+          OR COALESCE(dsp.nombre_completo, '') ILIKE $${params.length}
+        )
+      `;
+    }
+
+    const query = `
+      SELECT
+        vsd.id_venta_servicio,
+        vsd.id_venta,
+        vsd.id_solicitud_servicio,
+        vsd.id_detalle_servicio,
+        vsd.id_servicio,
+        vsd.nombre_servicio,
+        vsd.cantidad,
+        vsd.precio_unitario,
+        vsd.subtotal AS subtotal_servicio,
+        vsd.folio_servicio,
+        vsd.nombre_paciente,
+        vsd.fecha_creacion AS fecha_registro_servicio,
+
+        v.folio AS folio_venta,
+        v.id_sucursal,
+        suc.nombre AS sucursal,
+        v.id_caja,
+        c.nombre AS caja,
+        v.id_sesion,
+        v.id_usuario,
+        u.nombre AS cajero,
+        v.subtotal AS subtotal_venta,
+        v.subtotal_sin_descuento,
+        v.descuento_ofertas,
+        v.descuento,
+        v.impuesto,
+        v.total AS total_venta,
+        v.metodo_pago,
+        v.monto_recibido,
+        v.cambio,
+        v.estado AS estado_venta,
+        v.fecha_venta,
+
+        scs.estatus AS estatus_servicio,
+        scs.fecha_pago,
+        scs.fecha_realizado,
+        scs.diagnostico,
+        scs.observaciones,
+        scs.id_doctor,
+
+        dsp.nombre_completo AS doctor_shaddai
+      FROM venta_servicios_detalle vsd
+      INNER JOIN ventas v
+        ON v.id_venta = vsd.id_venta
+      LEFT JOIN servicios_clinicos_solicitudes scs
+        ON scs.id_solicitud_servicio = vsd.id_solicitud_servicio
+      LEFT JOIN sucursales suc
+        ON suc.id_sucursal = v.id_sucursal
+      LEFT JOIN cajas c
+        ON c.id_caja = v.id_caja
+      LEFT JOIN usuarios u
+        ON u.id_usuario = v.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT
+          d.nombre_completo
+        FROM doctores_shaddai_perfiles d
+        WHERE d.id_perfil = COALESCE(v.id_doctor, scs.id_doctor)
+           OR d.id_usuario = COALESCE(v.id_doctor, scs.id_doctor)
+        ORDER BY d.id_perfil ASC
+        LIMIT 1
+      ) dsp ON true
+      ${where}
+      ORDER BY v.fecha_venta DESC, vsd.id_venta_servicio DESC
+    `;
+
+    const resultado = await pool.query(query, params);
+
+    const resumenQuery = `
+      SELECT
+        COUNT(*)::int AS total_registros,
+        COUNT(DISTINCT v.id_venta)::int AS total_ventas,
+        COALESCE(SUM(vsd.cantidad), 0)::numeric(12,2) AS total_cantidad_servicios,
+        COALESCE(SUM(vsd.subtotal), 0)::numeric(12,2) AS subtotal_servicios
+      FROM venta_servicios_detalle vsd
+      INNER JOIN ventas v
+        ON v.id_venta = vsd.id_venta
+      LEFT JOIN servicios_clinicos_solicitudes scs
+        ON scs.id_solicitud_servicio = vsd.id_solicitud_servicio
+      LEFT JOIN sucursales suc
+        ON suc.id_sucursal = v.id_sucursal
+      LEFT JOIN cajas c
+        ON c.id_caja = v.id_caja
+      LEFT JOIN usuarios u
+        ON u.id_usuario = v.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT
+          d.nombre_completo
+        FROM doctores_shaddai_perfiles d
+        WHERE d.id_perfil = COALESCE(v.id_doctor, scs.id_doctor)
+           OR d.id_usuario = COALESCE(v.id_doctor, scs.id_doctor)
+        ORDER BY d.id_perfil ASC
+        LIMIT 1
+      ) dsp ON true
+      ${where}
+    `;
+
+    const resumenResultado = await pool.query(resumenQuery, params);
+    const resumen = resumenResultado.rows[0] || {};
+
+    return res.json({
+      ok: true,
+      ventas_servicios: resultado.rows,
+      resumen: {
+        total_registros: Number(resumen.total_registros || 0),
+        total_ventas: Number(resumen.total_ventas || 0),
+        total_cantidad_servicios: Number(resumen.total_cantidad_servicios || 0),
+        subtotal_servicios: Number(resumen.subtotal_servicios || 0),
+      },
+    });
+  } catch (error) {
+    console.error('Error al listar ventas de servicios clínicos:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al listar ventas de servicios clínicos',
+      error: error.message,
+    });
   }
 };

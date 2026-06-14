@@ -252,6 +252,66 @@ const obtenerDatosReporteCierreCaja = async (idSesion) => {
     [idSesion]
   );
 
+
+  const serviciosResultado = await pool.query(
+    `
+    SELECT
+      v.id_venta,
+      v.folio AS folio_venta,
+      v.fecha_venta,
+      v.metodo_pago,
+      v.total AS total_venta,
+
+      vsd.id_venta_servicio,
+      vsd.id_solicitud_servicio,
+      vsd.id_detalle_servicio,
+      vsd.id_servicio,
+      vsd.folio_servicio,
+      vsd.nombre_paciente,
+      vsd.nombre_servicio,
+      vsd.cantidad,
+      vsd.precio_unitario,
+      vsd.subtotal,
+
+      scs.estatus AS estatus_servicio,
+
+      dsp.nombre_completo AS doctor_shaddai
+    FROM venta_servicios_detalle vsd
+    INNER JOIN ventas v
+      ON v.id_venta = vsd.id_venta
+    LEFT JOIN servicios_clinicos_solicitudes scs
+      ON scs.id_solicitud_servicio = vsd.id_solicitud_servicio
+    LEFT JOIN LATERAL (
+      SELECT
+        d.nombre_completo
+      FROM doctores_shaddai_perfiles d
+      WHERE d.id_perfil = scs.id_doctor
+         OR d.id_usuario = scs.id_doctor
+      ORDER BY d.id_perfil ASC
+      LIMIT 1
+    ) dsp ON true
+    WHERE v.id_sesion = $1
+      AND v.estado = 'COMPLETADA'
+    ORDER BY v.fecha_venta ASC, vsd.id_venta_servicio ASC
+    `,
+    [idSesion]
+  );
+
+  const resumenServiciosResultado = await pool.query(
+    `
+    SELECT
+      COUNT(*)::int AS total_servicios,
+      COALESCE(SUM(vsd.cantidad), 0)::numeric(12,2) AS cantidad_servicios,
+      COALESCE(SUM(vsd.subtotal), 0)::numeric(12,2) AS total_servicios_clinicos
+    FROM venta_servicios_detalle vsd
+    INNER JOIN ventas v
+      ON v.id_venta = vsd.id_venta
+    WHERE v.id_sesion = $1
+      AND v.estado = 'COMPLETADA'
+    `,
+    [idSesion]
+  );
+
   const movimientosResultado = await pool.query(
     `
     SELECT
@@ -298,13 +358,28 @@ const obtenerDatosReporteCierreCaja = async (idSesion) => {
     resumen,
     ventas: ventasResultado.rows,
     productos: productosResultado.rows,
+    servicios: serviciosResultado.rows,
+    resumen_servicios: resumenServiciosResultado.rows[0] || {
+      total_servicios: 0,
+      cantidad_servicios: 0,
+      total_servicios_clinicos: 0,
+    },
     movimientos: movimientosResultado.rows,
     desglose: movimientosAgrupados,
     reporte_pdf: reportePdfResultado.rows[0] || null,
   };
 };
 
-const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, movimientos, logoBase64 }) => {
+const construirHtmlReporteCierreCaja = ({
+  sesion,
+  resumen,
+  ventas,
+  productos,
+  servicios = [],
+  resumen_servicios = {},
+  movimientos,
+  logoBase64,
+}) => {
   const ventasPuntos = Number(resumen.ventas_puntos || resumen.ventas_puntos_canjeados || 0);
   const puntosGanados = Number(resumen.puntos_ganados || 0);
   const salidasTotales =
@@ -313,6 +388,26 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
     Number(resumen.retiros_efectivo || 0) +
     Number(resumen.pagos_proveedor_efectivo || 0);
   const diferencia = Number(resumen.diferencia || sesion.diferencia || 0);
+
+
+  const totalServiciosClinicos = Number(
+    resumen_servicios.total_servicios_clinicos || 0
+  );
+
+  const filasServicios = servicios.length
+    ? servicios.map((servicio) => `
+      <tr>
+        <td>${escapeHtml(servicio.folio_venta || '—')}</td>
+        <td>${escapeHtml(servicio.folio_servicio || '—')}</td>
+        <td>${escapeHtml(servicio.nombre_paciente || '—')}</td>
+        <td>${escapeHtml(servicio.nombre_servicio || '—')}</td>
+        <td class="right strong">${escapeHtml(servicio.cantidad || 0)}</td>
+        <td class="right strong">${escapeHtml(formatoMonedaMXN(servicio.precio_unitario))}</td>
+        <td class="right strong">${escapeHtml(formatoMonedaMXN(servicio.subtotal))}</td>
+        <td>${escapeHtml(servicio.doctor_shaddai || '—')}</td>
+      </tr>
+    `).join('')
+    : '<tr><td colspan="8" class="empty">No hay servicios clínicos cobrados.</td></tr>';
 
   const filasVentas = ventas.length
     ? ventas.map((venta) => `
@@ -421,7 +516,7 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
         .grid { display: grid; gap: 10px; }
         .grid-3 { grid-template-columns: repeat(3, 1fr); }
         .grid-5 { grid-template-columns: repeat(5, 1fr); }
-        .grid-6 { grid-template-columns: repeat(6, 1fr); }
+        .grid-6 { grid-template-columns: repeat(4, 1fr); }
         .card {
           border: 1px solid #e2e8f0;
           border-radius: 14px;
@@ -511,8 +606,8 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
           <div class="header-row">
             <div class="brand-block">
               ${logoBase64
-                ? `<div class="logo-wrap"><img src="${escapeHtml(logoBase64)}" alt="Farmacia Shaddai" /></div>`
-                : '<div class="logo-fallback">FS</div>'}
+      ? `<div class="logo-wrap"><img src="${escapeHtml(logoBase64)}" alt="Farmacia Shaddai" /></div>`
+      : '<div class="logo-fallback">FS</div>'}
               <div>
                 <div class="brand">Farmacia Shaddai</div>
                 <h1>Reporte de cierre de caja</h1>
@@ -544,8 +639,9 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
           <div class="grid grid-6">
             <div class="metric"><div class="label">Monto inicial</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.monto_inicial))}</div></div>
             <div class="metric"><div class="label">Ventas efectivo</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_efectivo))}</div></div>
-            <div class="metric"><div class="label">Ventas no efectivo</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_no_efectivo))}</div></div>
-            <div class="metric"><div class="label">Ventas puntos</div><div class="value">${escapeHtml(formatoMonedaMXN(ventasPuntos))}</div></div>
+           <div class="metric"><div class="label">Ventas no efectivo</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_no_efectivo))}</div></div>
+<div class="metric"><div class="label">Servicios clínicos</div><div class="value">${escapeHtml(formatoMonedaMXN(totalServiciosClinicos))}</div></div>
+<div class="metric"><div class="label">Ventas puntos</div><div class="value">${escapeHtml(formatoMonedaMXN(ventasPuntos))}</div></div>
             <div class="metric"><div class="label">Puntos cajero</div><div class="value">${escapeHtml(puntosGanados.toFixed(2))}</div></div>
             <div class="metric"><div class="label">Total vendido</div><div class="value">${escapeHtml(formatoMonedaMXN(resumen.ventas_total))}</div></div>
           </div>
@@ -578,6 +674,25 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
         </section>
 
         <section>
+  <h2>Servicios clínicos cobrados</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Folio venta</th>
+        <th>Folio servicio</th>
+        <th>Paciente</th>
+        <th>Servicio</th>
+        <th class="right">Cantidad</th>
+        <th class="right">Precio</th>
+        <th class="right">Subtotal</th>
+        <th>Doctor</th>
+      </tr>
+    </thead>
+    <tbody>${filasServicios}</tbody>
+  </table>
+</section>
+
+        <section>
           <h2>Movimientos de caja</h2>
           <table>
             <thead><tr><th>Fecha</th><th>Tipo</th><th>Concepto</th><th>Método</th><th class="right">Monto</th></tr></thead>
@@ -588,6 +703,7 @@ const construirHtmlReporteCierreCaja = ({ sesion, resumen, ventas, productos, mo
         <section class="total-box">
           <h2 style="margin-top:0">Resultado final del corte</h2>
           <div class="total-row"><span>Total vendido</span><strong>${escapeHtml(formatoMonedaMXN(resumen.ventas_total))}</strong></div>
+         <div class="total-row"><span>Servicios clínicos</span><strong>${escapeHtml(formatoMonedaMXN(totalServiciosClinicos))}</strong></div>
           <div class="total-row"><span>Total no efectivo</span><strong>${escapeHtml(formatoMonedaMXN(resumen.ventas_no_efectivo))}</strong></div>
           <div class="total-row"><span>Ventas con puntos</span><strong>${escapeHtml(formatoMonedaMXN(ventasPuntos))}</strong></div>
           <div class="total-row"><span>Puntos cajero</span><strong>${escapeHtml(puntosGanados.toFixed(2))}</strong></div>

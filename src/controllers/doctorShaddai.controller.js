@@ -1242,6 +1242,683 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
 };
 
 /**
+ * Generar folio de servicio clínico
+ */
+const generarFolioServicioClinico = async (client) => {
+  const fecha = new Date();
+  const yyyy = fecha.getFullYear();
+  const mm = String(fecha.getMonth() + 1).padStart(2, '0');
+  const dd = String(fecha.getDate()).padStart(2, '0');
+  const fechaFolio = `${yyyy}${mm}${dd}`;
+
+  const folioResult = await client.query(
+    `
+    SELECT COUNT(*)::int AS total
+    FROM servicios_clinicos_solicitudes
+    WHERE TO_CHAR(fecha_creacion, 'YYYYMMDD') = $1;
+    `,
+    [fechaFolio]
+  );
+
+  const consecutivo = Number(folioResult.rows[0]?.total || 0) + 1;
+
+  return `SERV-${fechaFolio}-${String(consecutivo).padStart(6, '0')}`;
+};
+
+
+
+/**
+ * Crear solicitud de servicio clínico Doctor Shaddai
+ */
+export const crearServicioClinicoDoctorShaddai = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const idDoctor = obtenerIdUsuarioAutenticado(req) || null;
+
+    const {
+      paciente,
+      servicios,
+      id_paciente_expediente,
+      id_fila = null,
+      id_fila_atencion = null,
+      id_sucursal = null,
+      diagnostico = null,
+      observaciones = null,
+    } = req.body;
+
+    if (!idDoctor) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: 'No se pudo identificar al doctor autenticado.',
+      });
+    }
+
+    if (!paciente) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Los datos del paciente son obligatorios.',
+      });
+    }
+
+    if (!paciente.nombre_paciente || !paciente.nombre_paciente.trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El nombre del paciente es obligatorio.',
+      });
+    }
+
+    if (!Array.isArray(servicios) || servicios.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Debes agregar al menos un servicio clínico.',
+      });
+    }
+
+    const serviciosInvalidos = servicios.filter((servicio) => {
+      return (
+        !servicio.id_servicio ||
+        !servicio.nombre_servicio ||
+        !servicio.cantidad ||
+        Number(servicio.cantidad) <= 0
+      );
+    });
+
+    if (serviciosInvalidos.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Todos los servicios deben tener nombre y cantidad válida.',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const perfilDoctorResult = await client.query(
+      `
+      SELECT
+        id_perfil,
+        id_usuario,
+        nombre_completo,
+        cedula_profesional,
+        especialidad,
+        telefono,
+        correo,
+        direccion_consultorio,
+        observaciones,
+        perfil_completo
+      FROM doctores_shaddai_perfiles
+      WHERE id_usuario = $1
+        AND activo = true
+      LIMIT 1;
+      `,
+      [idDoctor]
+    );
+
+    if (perfilDoctorResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        codigo: 'PERFIL_DOCTOR_INCOMPLETO',
+        mensaje:
+          'Debes completar tu perfil de Doctor Shaddai antes de generar servicios clínicos.',
+      });
+    }
+
+    const perfilDoctor = perfilDoctorResult.rows[0];
+
+    if (
+      perfilDoctor.perfil_completo !== true ||
+      !perfilDoctor.nombre_completo ||
+      !perfilDoctor.cedula_profesional ||
+      !perfilDoctor.especialidad
+    ) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        codigo: 'PERFIL_DOCTOR_INCOMPLETO',
+        mensaje:
+          'Debes completar tu perfil de Doctor Shaddai antes de generar servicios clínicos.',
+      });
+    }
+
+    if (id_paciente_expediente) {
+      const expedienteResult = await client.query(
+        `
+        SELECT id_expediente
+        FROM expedientes_clinicos
+        WHERE id_expediente = $1
+          AND activo = true
+        LIMIT 1;
+        `,
+        [id_paciente_expediente]
+      );
+
+      if (expedienteResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'El expediente seleccionado no existe o está inactivo.',
+        });
+      }
+    }
+
+    const idFilaFinal =
+      limpiarNumero(id_fila) ||
+      limpiarNumero(id_fila_atencion) ||
+      null;
+
+    const idSucursalFinal = await obtenerIdSucursalDoctor(
+      client,
+      req,
+      idDoctor,
+      id_sucursal
+    );
+
+    const diagnosticoFinal =
+      limpiarTexto(diagnostico) ||
+      limpiarTexto(paciente?.diagnostico) ||
+      null;
+
+    const observacionesFinal =
+      limpiarTexto(observaciones) ||
+      limpiarTexto(paciente?.observaciones) ||
+      null;
+
+    const folioServicio = await generarFolioServicioClinico(client);
+
+    let totalServicio = 0;
+
+    const serviciosNormalizados = servicios.map((servicio) => {
+      const cantidad = Number(servicio.cantidad || 1);
+      const precioUnitario = Number(servicio.precio_unitario ?? servicio.precio ?? 0);
+      const subtotal = Number((cantidad * precioUnitario).toFixed(2));
+
+      totalServicio += subtotal;
+
+      return {
+        id_servicio: Number(servicio.id_servicio),
+        id_producto: servicio.id_producto ? Number(servicio.id_producto) : null,
+        nombre_servicio: limpiarTexto(servicio.nombre_servicio),
+        cantidad,
+        precio_unitario: precioUnitario,
+        subtotal,
+        indicaciones: limpiarTexto(servicio.indicaciones),
+        observaciones: limpiarTexto(servicio.observaciones),
+      };
+    });
+
+    totalServicio = Number(totalServicio.toFixed(2));
+
+    const querySolicitud = `
+      INSERT INTO servicios_clinicos_solicitudes (
+        id_paciente_expediente,
+        id_fila,
+        id_sucursal,
+        id_doctor,
+        folio_servicio,
+        nombre_paciente,
+        telefono_paciente,
+        edad_paciente,
+        sexo_paciente,
+        diagnostico,
+        observaciones,
+        estatus,
+        total
+      )
+      VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        $10, $11,
+        'PENDIENTE_CAJERO',
+        $12
+      )
+      RETURNING *;
+    `;
+
+    const valuesSolicitud = [
+      id_paciente_expediente || null,
+      idFilaFinal,
+      idSucursalFinal,
+      idDoctor,
+      folioServicio,
+      paciente.nombre_paciente.trim(),
+      paciente.telefono?.trim() || null,
+      paciente.edad ? Number(paciente.edad) : null,
+      paciente.sexo || null,
+      diagnosticoFinal,
+      observacionesFinal,
+      totalServicio,
+    ];
+
+    const solicitudResult = await client.query(querySolicitud, valuesSolicitud);
+    const solicitud = solicitudResult.rows[0];
+
+    const detallesInsertados = [];
+
+    for (const servicio of serviciosNormalizados) {
+      const servicioDbResult = await client.query(
+        `
+        SELECT
+          id_servicio,
+          nombre,
+          descripcion,
+          precio,
+          requiere_producto,
+          activo
+        FROM cat_servicios_clinicos
+        WHERE id_servicio = $1
+          AND activo = true
+        LIMIT 1;
+        `,
+        [servicio.id_servicio]
+      );
+
+      if (servicioDbResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: `El servicio clínico ${servicio.id_servicio} no existe o está inactivo.`,
+        });
+      }
+
+      const servicioCatalogo = servicioDbResult.rows[0];
+
+      const requiereProducto =
+        servicioCatalogo.requiere_producto === true ||
+        servicioCatalogo.requiere_producto === 'true';
+
+      if (requiereProducto && !servicio.id_producto) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: `El servicio ${servicioCatalogo.nombre} requiere seleccionar un producto relacionado.`,
+        });
+      }
+
+      const queryDetalle = `
+        INSERT INTO servicios_clinicos_solicitudes_detalle (
+          id_solicitud_servicio,
+          id_servicio,
+          id_producto,
+          nombre_servicio,
+          cantidad,
+          precio_unitario,
+          subtotal,
+          indicaciones,
+          observaciones
+        )
+        VALUES (
+          $1, $2, $3, $4,
+          $5, $6, $7,
+          $8, $9
+        )
+        RETURNING *;
+      `;
+
+      const valuesDetalle = [
+        solicitud.id_solicitud_servicio,
+        servicio.id_servicio,
+        servicio.id_producto,
+        servicio.nombre_servicio || servicioCatalogo.nombre,
+        servicio.cantidad,
+        servicio.precio_unitario,
+        servicio.subtotal,
+        servicio.indicaciones,
+        servicio.observaciones,
+      ];
+
+      const detalleResult = await client.query(queryDetalle, valuesDetalle);
+      detallesInsertados.push(detalleResult.rows[0]);
+    }
+
+    const documentoClinico = await registrarDocumentoClinico(client, {
+      id_expediente: id_paciente_expediente || null,
+      id_fila: idFilaFinal,
+      id_doctor: idDoctor,
+      id_sucursal: idSucursalFinal,
+
+      tipo_documento: 'SERVICIO_CLINICO',
+      id_origen: solicitud.id_solicitud_servicio,
+      folio: solicitud.folio_servicio,
+      titulo: 'Servicio clínico',
+      descripcion:
+        diagnosticoFinal ||
+        observacionesFinal ||
+        detallesInsertados.map((item) => item.nombre_servicio).join(', ') ||
+        'Servicio clínico',
+      estatus: solicitud.estatus || 'PENDIENTE_CAJERO',
+
+      tabla_origen: 'servicios_clinicos_solicitudes',
+      ruta_frontend: `/app/doctor-shaddai/servicios-clinicos?id_solicitud_servicio=${solicitud.id_solicitud_servicio}`,
+
+      metadata: {
+        nombre_paciente: solicitud.nombre_paciente,
+        telefono_paciente: solicitud.telefono_paciente,
+        edad_paciente: solicitud.edad_paciente,
+        sexo_paciente: solicitud.sexo_paciente,
+        diagnostico: diagnosticoFinal,
+        observaciones: observacionesFinal,
+        total_servicios: detallesInsertados.length,
+        total: solicitud.total,
+      },
+    });
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Servicio clínico generado correctamente.',
+      solicitud,
+      detalles: detallesInsertados,
+      doctor: perfilDoctor,
+      documento_clinico: documentoClinico,
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error al hacer rollback:', rollbackError);
+    }
+
+    console.error('Error al crear servicio clínico Doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al generar el servicio clínico.',
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Listar servicios clínicos Doctor Shaddai
+ */
+export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
+  try {
+    const { estatus, busqueda } = req.query;
+
+    const filtros = [];
+    const valores = [];
+
+    filtros.push('s.activo = true');
+
+    const idUsuario = obtenerIdUsuarioAutenticado(req);
+    const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+
+    if (!esCajeroOAdmin) {
+      valores.push(idUsuario);
+      filtros.push(`s.id_doctor = $${valores.length}`);
+    }
+
+    if (estatus) {
+      const estatusLista = String(estatus)
+        .split(',')
+        .map((item) => item.trim().toUpperCase())
+        .filter(Boolean);
+
+      if (estatusLista.length > 0) {
+        valores.push(estatusLista);
+        filtros.push(`s.estatus = ANY($${valores.length}::text[])`);
+      }
+    }
+
+    if (busqueda && String(busqueda).trim()) {
+      valores.push(`%${String(busqueda).trim()}%`);
+
+      filtros.push(`
+        (
+          s.folio_servicio ILIKE $${valores.length}
+          OR s.nombre_paciente ILIKE $${valores.length}
+          OR s.telefono_paciente ILIKE $${valores.length}
+          OR s.diagnostico ILIKE $${valores.length}
+          OR s.observaciones ILIKE $${valores.length}
+          OR dsp.nombre_completo ILIKE $${valores.length}
+          OR dsp.especialidad ILIKE $${valores.length}
+        )
+      `);
+    }
+
+    const where = filtros.length > 0 ? `WHERE ${filtros.join(' AND ')}` : '';
+
+    const resultado = await pool.query(
+      `
+      SELECT
+        s.id_solicitud_servicio,
+        s.id_paciente_expediente,
+        s.id_fila,
+        s.id_sucursal,
+        s.id_doctor,
+        s.folio_servicio,
+        s.nombre_paciente,
+        s.telefono_paciente,
+        s.edad_paciente,
+        s.sexo_paciente,
+        s.diagnostico,
+        s.observaciones,
+        s.estatus,
+        s.total,
+        s.fecha_creacion,
+        s.fecha_actualizacion,
+        s.fecha_pago,
+        s.fecha_realizado,
+        s.activo,
+
+        dsp.nombre_completo AS nombre_doctor,
+        dsp.nombre_completo AS nombre_doctor_shaddai,
+        dsp.cedula_profesional,
+        dsp.especialidad,
+
+        COUNT(sd.id_detalle_servicio)::int AS total_servicios,
+        COALESCE(SUM(sd.cantidad), 0)::numeric AS total_cantidad
+
+      FROM servicios_clinicos_solicitudes s
+      LEFT JOIN doctores_shaddai_perfiles dsp
+        ON dsp.id_usuario = s.id_doctor
+       AND dsp.activo = true
+      LEFT JOIN servicios_clinicos_solicitudes_detalle sd
+        ON sd.id_solicitud_servicio = s.id_solicitud_servicio
+       AND sd.activo = true
+      ${where}
+      GROUP BY
+        s.id_solicitud_servicio,
+        dsp.nombre_completo,
+        dsp.cedula_profesional,
+        dsp.especialidad
+      ORDER BY s.fecha_creacion DESC;
+      `,
+      valores
+    );
+
+    return res.json({
+      ok: true,
+      servicios: resultado.rows,
+    });
+  } catch (error) {
+    console.error('Error al listar servicios clínicos Doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al listar servicios clínicos.',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Obtener servicio clínico Doctor Shaddai por ID
+ */
+export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const idUsuario = obtenerIdUsuarioAutenticado(req);
+    const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+
+    const filtros = ['s.id_solicitud_servicio = $1', 's.activo = true'];
+    const valores = [id];
+
+    if (!esCajeroOAdmin) {
+      valores.push(idUsuario);
+      filtros.push(`s.id_doctor = $${valores.length}`);
+    }
+
+    const solicitudResult = await pool.query(
+      `
+      SELECT
+        s.*,
+        u.nombre AS nombre_doctor_usuario,
+        dsp.nombre_completo AS nombre_doctor,
+        dsp.cedula_profesional,
+        dsp.especialidad,
+        dsp.telefono AS telefono_doctor,
+        dsp.correo AS correo_doctor,
+        dsp.direccion_consultorio
+      FROM servicios_clinicos_solicitudes s
+      LEFT JOIN usuarios u
+        ON u.id_usuario = s.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles dsp
+        ON dsp.id_usuario = s.id_doctor
+       AND dsp.activo = true
+      WHERE ${filtros.join(' AND ')}
+      LIMIT 1;
+      `,
+      valores
+    );
+
+    if (solicitudResult.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Servicio clínico no encontrado o no tienes permiso para verlo.',
+      });
+    }
+
+    const detalleResult = await pool.query(
+      `
+      SELECT
+        sd.id_detalle_servicio,
+        sd.id_solicitud_servicio,
+        sd.id_servicio,
+        sd.id_producto,
+        sd.nombre_servicio,
+        sd.cantidad,
+        sd.precio_unitario,
+        sd.subtotal,
+        sd.indicaciones,
+        sd.observaciones,
+        sd.activo,
+        sd.fecha_creacion,
+
+        cs.descripcion AS descripcion_catalogo,
+        cs.requiere_producto,
+
+        p.nombre AS nombre_producto,
+        p.codigo_barras
+
+      FROM servicios_clinicos_solicitudes_detalle sd
+      LEFT JOIN cat_servicios_clinicos cs
+        ON cs.id_servicio = sd.id_servicio
+      LEFT JOIN productos p
+        ON p.id_producto = sd.id_producto
+      WHERE sd.id_solicitud_servicio = $1
+        AND sd.activo = true
+      ORDER BY sd.id_detalle_servicio ASC;
+      `,
+      [id]
+    );
+
+    return res.json({
+      ok: true,
+      solicitud: solicitudResult.rows[0],
+      detalles: detalleResult.rows,
+    });
+  } catch (error) {
+    console.error('Error al obtener servicio clínico Doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al obtener el servicio clínico.',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Cancelar servicio clínico Doctor Shaddai
+ */
+export const cancelarServicioClinicoDoctorShaddai = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const idUsuario = obtenerIdUsuarioAutenticado(req);
+    const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+
+    const valores = [id];
+    let filtroPropietario = '';
+
+    if (!esCajeroOAdmin) {
+      valores.push(idUsuario);
+      filtroPropietario = `AND id_doctor = $${valores.length}`;
+    }
+
+    const resultado = await pool.query(
+      `
+      UPDATE servicios_clinicos_solicitudes
+      SET
+        estatus = 'CANCELADO',
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_solicitud_servicio = $1
+        AND activo = true
+        AND estatus NOT IN ('PAGADO', 'REALIZADO', 'CANCELADO')
+        ${filtroPropietario}
+      RETURNING *;
+      `,
+      valores
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje:
+          'Servicio clínico no encontrado, ya fue cobrado/realizado o no tienes permiso para cancelarlo.',
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE documentos_clinicos
+      SET
+        estatus = 'CANCELADO',
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE tabla_origen = 'servicios_clinicos_solicitudes'
+        AND id_origen = $1;
+      `,
+      [id]
+    );
+
+    return res.json({
+      ok: true,
+      mensaje: 'Servicio clínico cancelado correctamente.',
+      solicitud: resultado.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al cancelar servicio clínico Doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error al cancelar el servicio clínico.',
+      error: error.message,
+    });
+  }
+};
+
+/**
  * Listar recetas Doctor Shaddai
  */
 export const listarRecetasDoctorShaddai = async (req, res) => {
@@ -1725,5 +2402,328 @@ export const surtirRecetaDoctorShaddai = async (req, res) => {
     });
   } finally {
     client.release();
+  }
+};
+
+
+export const listarCatalogoServiciosClinicos = async (req, res) => {
+  try {
+    const { busqueda = '', incluir_inactivos = 'false' } = req.query;
+
+    const params = [];
+    let where = 'WHERE 1 = 1';
+
+    const incluirInactivos =
+      incluir_inactivos === true ||
+      incluir_inactivos === 'true' ||
+      incluir_inactivos === '1';
+
+    if (!incluirInactivos) {
+      where += ' AND activo = true';
+    }
+
+    if (String(busqueda).trim()) {
+      params.push(`%${String(busqueda).trim()}%`);
+      where += `
+        AND (
+          nombre ILIKE $${params.length}
+          OR COALESCE(descripcion, '') ILIKE $${params.length}
+        )
+      `;
+    }
+
+    const resultado = await pool.query(
+      `
+      SELECT
+        id_servicio,
+        nombre,
+        descripcion,
+        precio,
+        requiere_producto,
+        activo,
+        fecha_creacion,
+        fecha_actualizacion
+      FROM cat_servicios_clinicos
+      ${where}
+      ORDER BY activo DESC, nombre ASC
+      `,
+      params
+    );
+
+    return res.json({
+      ok: true,
+      servicios: resultado.rows,
+    });
+  } catch (error) {
+    console.error('Error al listar catálogo de servicios clínicos:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al listar catálogo de servicios clínicos.',
+      error: error.message,
+    });
+  }
+};
+
+export const crearServicioClinicoCatalogo = async (req, res) => {
+  try {
+    const {
+      nombre,
+      descripcion = null,
+      precio = 0,
+      requiere_producto = false,
+      activo = true,
+    } = req.body;
+
+    const nombreLimpio = limpiarTexto(nombre);
+
+    if (!nombreLimpio) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El nombre del servicio es obligatorio.',
+      });
+    }
+
+    const precioNumerico = Number(precio || 0);
+
+    if (Number.isNaN(precioNumerico) || precioNumerico < 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El precio debe ser un número mayor o igual a cero.',
+      });
+    }
+
+    const existe = await pool.query(
+      `
+      SELECT id_servicio
+      FROM cat_servicios_clinicos
+      WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
+      LIMIT 1
+      `,
+      [nombreLimpio]
+    );
+
+    if (existe.rows.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        mensaje: 'Ya existe un servicio clínico con ese nombre.',
+      });
+    }
+
+    const resultado = await pool.query(
+      `
+      INSERT INTO cat_servicios_clinicos (
+        nombre,
+        descripcion,
+        precio,
+        requiere_producto,
+        activo
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING
+        id_servicio,
+        nombre,
+        descripcion,
+        precio,
+        requiere_producto,
+        activo,
+        fecha_creacion,
+        fecha_actualizacion
+      `,
+      [
+        nombreLimpio,
+        limpiarTexto(descripcion),
+        precioNumerico,
+        requiere_producto === true || requiere_producto === 'true' || requiere_producto === 1 || requiere_producto === '1',
+        activo === true || activo === 'true' || activo === 1 || activo === '1',
+      ]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Servicio clínico creado correctamente.',
+      servicio: resultado.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al crear servicio clínico del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al crear servicio clínico.',
+      error: error.message,
+    });
+  }
+};
+
+export const actualizarServicioClinicoCatalogo = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      nombre,
+      descripcion = null,
+      precio = 0,
+      requiere_producto = false,
+      activo = true,
+    } = req.body;
+
+    const idServicio = Number(id || 0);
+
+    if (!idServicio) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'ID de servicio inválido.',
+      });
+    }
+
+    const nombreLimpio = limpiarTexto(nombre);
+
+    if (!nombreLimpio) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El nombre del servicio es obligatorio.',
+      });
+    }
+
+    const precioNumerico = Number(precio || 0);
+
+    if (Number.isNaN(precioNumerico) || precioNumerico < 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El precio debe ser un número mayor o igual a cero.',
+      });
+    }
+
+    const duplicado = await pool.query(
+      `
+      SELECT id_servicio
+      FROM cat_servicios_clinicos
+      WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
+        AND id_servicio <> $2
+      LIMIT 1
+      `,
+      [nombreLimpio, idServicio]
+    );
+
+    if (duplicado.rows.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        mensaje: 'Ya existe otro servicio clínico con ese nombre.',
+      });
+    }
+
+    const resultado = await pool.query(
+      `
+      UPDATE cat_servicios_clinicos
+      SET
+        nombre = $1,
+        descripcion = $2,
+        precio = $3,
+        requiere_producto = $4,
+        activo = $5,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_servicio = $6
+      RETURNING
+        id_servicio,
+        nombre,
+        descripcion,
+        precio,
+        requiere_producto,
+        activo,
+        fecha_creacion,
+        fecha_actualizacion
+      `,
+      [
+        nombreLimpio,
+        limpiarTexto(descripcion),
+        precioNumerico,
+        requiere_producto === true || requiere_producto === 'true' || requiere_producto === 1 || requiere_producto === '1',
+        activo === true || activo === 'true' || activo === 1 || activo === '1',
+        idServicio,
+      ]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Servicio clínico no encontrado.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Servicio clínico actualizado correctamente.',
+      servicio: resultado.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar servicio clínico del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al actualizar servicio clínico.',
+      error: error.message,
+    });
+  }
+};
+
+export const cambiarEstatusServicioClinicoCatalogo = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { activo } = req.body;
+
+    const idServicio = Number(id || 0);
+
+    if (!idServicio) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'ID de servicio inválido.',
+      });
+    }
+
+    const activoFinal =
+      activo === true || activo === 'true' || activo === 1 || activo === '1';
+
+    const resultado = await pool.query(
+      `
+      UPDATE cat_servicios_clinicos
+      SET
+        activo = $1,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_servicio = $2
+      RETURNING
+        id_servicio,
+        nombre,
+        descripcion,
+        precio,
+        requiere_producto,
+        activo,
+        fecha_creacion,
+        fecha_actualizacion
+      `,
+      [activoFinal, idServicio]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'Servicio clínico no encontrado.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: activoFinal
+        ? 'Servicio clínico activado correctamente.'
+        : 'Servicio clínico desactivado correctamente.',
+      servicio: resultado.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al cambiar estatus del servicio clínico:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al cambiar estatus del servicio clínico.',
+      error: error.message,
+    });
   }
 };
