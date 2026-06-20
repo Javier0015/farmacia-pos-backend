@@ -2,27 +2,69 @@ import { pool } from '../config/db.js';
 
 const DIAS_HISTORIAL_ALERTAS = 7;
 
+const crearErrorHttp = (status, mensaje) => {
+  const error = new Error(mensaje);
+  error.status = status;
+  return error;
+};
+
+const obtenerIdUsuario = (usuario) => {
+  return Number(usuario?.id_usuario || usuario?.id || 0);
+};
+
 const obtenerRolUsuario = (usuario) => {
-  return String(usuario?.rol || usuario?.perfil || usuario?.nombre_rol || '').toUpperCase();
+  return String(
+    usuario?.rol ||
+      usuario?.perfil ||
+      usuario?.nombre_rol ||
+      usuario?.tipo_usuario ||
+      ''
+  )
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_');
+};
+
+const esSuperAdministrador = (rolUsuario) => {
+  return rolUsuario === 'SUPER_ADMIN' || rolUsuario === 'SUPERADMIN';
+};
+
+const normalizarIdSucursal = (valor) => {
+  if (valor === undefined || valor === null || String(valor).trim() === '') {
+    return null;
+  }
+
+  const idSucursal = Number(valor);
+
+  return Number.isInteger(idSucursal) && idSucursal > 0 ? idSucursal : null;
+};
+
+const obtenerIdSucursalPrincipalDesdeToken = (usuario) => {
+  const candidatos = [
+    usuario?.id_sucursal,
+    usuario?.sucursal_id,
+    usuario?.sucursal?.id_sucursal,
+    usuario?.sucursal?.id,
+  ];
+
+  for (const candidato of candidatos) {
+    const idSucursal = normalizarIdSucursal(candidato);
+
+    if (idSucursal) {
+      return idSucursal;
+    }
+  }
+
+  return null;
 };
 
 const obtenerSucursalesUsuarioDesdeToken = (usuario) => {
   const ids = [];
 
-  if (usuario?.id_sucursal) {
-    ids.push(Number(usuario.id_sucursal));
-  }
+  const idSucursalPrincipal = obtenerIdSucursalPrincipalDesdeToken(usuario);
 
-  if (usuario?.sucursal_id) {
-    ids.push(Number(usuario.sucursal_id));
-  }
-
-  if (usuario?.sucursal?.id_sucursal) {
-    ids.push(Number(usuario.sucursal.id_sucursal));
-  }
-
-  if (usuario?.sucursal?.id) {
-    ids.push(Number(usuario.sucursal.id));
+  if (idSucursalPrincipal) {
+    ids.push(idSucursalPrincipal);
   }
 
   const sucursales =
@@ -35,32 +77,38 @@ const obtenerSucursalesUsuarioDesdeToken = (usuario) => {
   if (Array.isArray(sucursales)) {
     sucursales.forEach((sucursal) => {
       if (typeof sucursal === 'number' || typeof sucursal === 'string') {
-        ids.push(Number(sucursal));
+        const idSucursal = normalizarIdSucursal(sucursal);
+
+        if (idSucursal) {
+          ids.push(idSucursal);
+        }
+
         return;
       }
 
-      const id =
-        sucursal?.id_sucursal ||
-        sucursal?.id ||
-        sucursal?.sucursal_id;
+      const idSucursal = normalizarIdSucursal(
+        sucursal?.id_sucursal || sucursal?.id || sucursal?.sucursal_id
+      );
 
-      if (id) {
-        ids.push(Number(id));
+      if (idSucursal) {
+        ids.push(idSucursal);
       }
     });
   }
 
-  return [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+  return [...new Set(ids)];
 };
 
+/**
+ * Obtiene todas las sucursales disponibles para el usuario.
+ *
+ * Se combinan las sucursales incluidas en el JWT con las asignadas en la
+ * base de datos. No se hace retorno anticipado usando solamente el token,
+ * porque un usuario puede estar asignado a más de una sucursal.
+ */
 const obtenerSucursalesUsuario = async (usuario) => {
-  const idsDesdeToken = obtenerSucursalesUsuarioDesdeToken(usuario);
-
-  if (idsDesdeToken.length > 0) {
-    return idsDesdeToken;
-  }
-
-  const idUsuario = usuario?.id_usuario;
+  const ids = new Set(obtenerSucursalesUsuarioDesdeToken(usuario));
+  const idUsuario = obtenerIdUsuario(usuario);
 
   if (!idUsuario) {
     return [];
@@ -69,12 +117,13 @@ const obtenerSucursalesUsuario = async (usuario) => {
   const consultas = [
     `
       SELECT id_sucursal
-      FROM usuarios_sucursales
+      FROM usuario_sucursales
       WHERE id_usuario = $1
+        AND COALESCE(activo, true) = true
     `,
     `
       SELECT id_sucursal
-      FROM usuario_sucursales
+      FROM usuarios_sucursales
       WHERE id_usuario = $1
     `,
     `
@@ -89,25 +138,109 @@ const obtenerSucursalesUsuario = async (usuario) => {
     try {
       const { rows } = await pool.query(consulta, [idUsuario]);
 
-      if (rows.length > 0) {
-        return [
-          ...new Set(
-            rows
-              .map((row) => Number(row.id_sucursal))
-              .filter((id) => Number.isInteger(id) && id > 0)
-          ),
-        ];
-      }
+      rows.forEach((row) => {
+        const idSucursal = normalizarIdSucursal(row.id_sucursal);
+
+        if (idSucursal) {
+          ids.add(idSucursal);
+        }
+      });
     } catch (error) {
-      // Se ignora para intentar con el siguiente posible nombre de tabla.
+      /*
+       * Algunos proyectos usan solo una de las tablas anteriores.
+       * Si una tabla no existe, se intenta la siguiente alternativa.
+       */
     }
   }
 
-  return [];
+  return [...ids].sort((a, b) => a - b);
+};
+
+const obtenerSucursalSolicitada = (req) => {
+  const valor =
+    req.query?.id_sucursal ??
+    req.query?.sucursal ??
+    req.body?.id_sucursal ??
+    req.body?.sucursal ??
+    null;
+
+  const seEnvioSucursal =
+    valor !== undefined && valor !== null && String(valor).trim() !== '';
+
+  if (!seEnvioSucursal) {
+    return {
+      seEnvioSucursal: false,
+      idSucursal: null,
+    };
+  }
+
+  const idSucursal = normalizarIdSucursal(valor);
+
+  if (!idSucursal) {
+    throw crearErrorHttp(400, 'La sucursal seleccionada no es válida.');
+  }
+
+  return {
+    seEnvioSucursal: true,
+    idSucursal,
+  };
+};
+
+/**
+ * Determina la sucursal activa para la consulta de alertas.
+ *
+ * Regla principal:
+ * - El frontend debe enviar id_sucursal de la sucursal actualmente seleccionada.
+ * - El backend valida que el usuario tenga acceso a esa sucursal.
+ * - Cuando no se envía, se usa la sucursal principal del JWT como compatibilidad.
+ */
+const obtenerContextoAlertas = async (req) => {
+  const idUsuario = obtenerIdUsuario(req.usuario);
+
+  if (!idUsuario) {
+    throw crearErrorHttp(401, 'No se pudo identificar al usuario autenticado.');
+  }
+
+  const rolUsuario = obtenerRolUsuario(req.usuario);
+  const esSuperAdmin = esSuperAdministrador(rolUsuario);
+  const sucursalesUsuario = await obtenerSucursalesUsuario(req.usuario);
+  const sucursalSolicitada = obtenerSucursalSolicitada(req);
+
+  let idSucursalActiva = null;
+
+  if (sucursalSolicitada.seEnvioSucursal) {
+    if (
+      !esSuperAdmin &&
+      !sucursalesUsuario.includes(sucursalSolicitada.idSucursal)
+    ) {
+      throw crearErrorHttp(
+        403,
+        'No tienes acceso a la sucursal seleccionada para consultar alertas.'
+      );
+    }
+
+    idSucursalActiva = sucursalSolicitada.idSucursal;
+  } else {
+    const idSucursalToken = obtenerIdSucursalPrincipalDesdeToken(req.usuario);
+
+    if (idSucursalToken) {
+      idSucursalActiva = idSucursalToken;
+    } else if (sucursalesUsuario.length === 1) {
+      idSucursalActiva = sucursalesUsuario[0];
+    }
+  }
+
+  return {
+    idUsuario,
+    rolUsuario,
+    esSuperAdmin,
+    idSucursalActiva,
+    sucursalesUsuario,
+  };
 };
 
 const normalizarPrioridad = (prioridad) => {
-  const valor = String(prioridad || 'NORMAL').toUpperCase();
+  const valor = String(prioridad || 'NORMAL').trim().toUpperCase();
 
   const prioridadesPermitidas = ['NORMAL', 'IMPORTANTE', 'URGENTE'];
 
@@ -115,7 +248,7 @@ const normalizarPrioridad = (prioridad) => {
 };
 
 const normalizarTipoDestino = (tipoDestino) => {
-  const valor = String(tipoDestino || 'TODOS').toUpperCase();
+  const valor = String(tipoDestino || 'TODOS').trim().toUpperCase();
 
   const tiposPermitidos = [
     'TODOS',
@@ -128,61 +261,150 @@ const normalizarTipoDestino = (tipoDestino) => {
   return tiposPermitidos.includes(valor) ? valor : 'TODOS';
 };
 
-const construirFiltroAlertasUsuario = () => {
+const normalizarRolDestino = (rol) => {
+  if (rol === undefined || rol === null || String(rol).trim() === '') {
+    return null;
+  }
+
+  return String(rol)
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_');
+};
+
+/**
+ * Construye el filtro de alertas visibles para un usuario.
+ *
+ * Parámetros por defecto:
+ * $1 id_usuario
+ * $2 rol
+ * $3 es_super_admin
+ * $4 id_sucursal_activa
+ *
+ * Se permiten parámetros alternos para evitar colisiones en consultas donde
+ * $1 se usa para otro valor, como marcar una alerta específica como leída.
+ */
+const construirFiltroAlertasUsuario = ({
+  idUsuarioParam = '$1',
+  rolUsuarioParam = '$2',
+  esSuperAdminParam = '$3',
+  idSucursalActivaParam = '$4',
+} = {}) => {
   return `
     COALESCE(a.activa, true) = true
     AND (
-      a.tipo_destino IS NULL
-      OR a.tipo_destino = 'TODOS'
+      a.tipo_destino = 'TODOS'
 
       OR (
         a.tipo_destino = 'ROL'
-        AND a.destino_rol = $2
+        AND a.destino_rol = ${rolUsuarioParam}
       )
 
       OR (
         a.tipo_destino = 'SUCURSAL'
         AND (
-          $3 = true
-          OR a.id_sucursal = ANY($4::int[])
+          ${esSuperAdminParam} = true
+          OR a.id_sucursal = ${idSucursalActivaParam}
         )
       )
 
       OR (
         a.tipo_destino = 'ROL_SUCURSAL'
-        AND a.destino_rol = $2
+        AND a.destino_rol = ${rolUsuarioParam}
         AND (
-          $3 = true
-          OR a.id_sucursal = ANY($4::int[])
+          ${esSuperAdminParam} = true
+          OR a.id_sucursal = ${idSucursalActivaParam}
         )
       )
 
       OR (
         a.tipo_destino = 'USUARIO'
-        AND a.id_usuario_destino = $1
+        AND a.id_usuario_destino = ${idUsuarioParam}
       )
 
+      /*
+       * Compatibilidad con alertas antiguas cuyo tipo_destino sea NULL.
+       * No se usa "a.tipo_destino IS NULL" por sí solo, porque eso haría
+       * visibles las alertas históricas para todas las sucursales.
+       */
       OR (
         a.tipo_destino IS NULL
         AND (
           a.destino_rol IS NULL
           OR a.destino_rol = 'TODOS'
-          OR a.destino_rol = $2
+          OR a.destino_rol = ${rolUsuarioParam}
         )
         AND (
           a.id_sucursal IS NULL
-          OR $3 = true
-          OR a.id_sucursal = ANY($4::int[])
+          OR ${esSuperAdminParam} = true
+          OR a.id_sucursal = ${idSucursalActivaParam}
         )
       )
     )
   `;
 };
 
-const construirFiltroHistorialReciente = () => {
+const construirFiltroHistorialReciente = (diasParam = '$5') => {
   return `
-    AND a.fecha_creacion >= NOW() - ($5::int * INTERVAL '1 day')
+    AND a.fecha_creacion >= NOW() - (${diasParam}::int * INTERVAL '1 day')
   `;
+};
+
+const validarDestinoAlerta = async ({
+  req,
+  tipoDestino,
+  destinoRol,
+  idSucursalDestino,
+  idUsuarioDestino,
+}) => {
+  const contexto = await obtenerContextoAlertas(req);
+
+  if (tipoDestino === 'TODOS' && !contexto.esSuperAdmin) {
+    throw crearErrorHttp(
+      403,
+      'Solo un superadministrador puede crear alertas globales.'
+    );
+  }
+
+  if (
+    ['ROL', 'ROL_SUCURSAL'].includes(tipoDestino) &&
+    !destinoRol
+  ) {
+    throw crearErrorHttp(
+      400,
+      'Debes indicar el rol destino para este tipo de alerta.'
+    );
+  }
+
+  if (
+    ['SUCURSAL', 'ROL_SUCURSAL'].includes(tipoDestino) &&
+    !idSucursalDestino
+  ) {
+    throw crearErrorHttp(
+      400,
+      'Debes indicar la sucursal destino para este tipo de alerta.'
+    );
+  }
+
+  if (tipoDestino === 'USUARIO' && !idUsuarioDestino) {
+    throw crearErrorHttp(
+      400,
+      'Debes indicar el usuario destino para este tipo de alerta.'
+    );
+  }
+
+  if (
+    ['SUCURSAL', 'ROL_SUCURSAL'].includes(tipoDestino) &&
+    !contexto.esSuperAdmin &&
+    !contexto.sucursalesUsuario.includes(idSucursalDestino)
+  ) {
+    throw crearErrorHttp(
+      403,
+      'No tienes permiso para enviar alertas a esa sucursal.'
+    );
+  }
+
+  return contexto;
 };
 
 export const crearAlerta = async (req, res) => {
@@ -191,7 +413,8 @@ export const crearAlerta = async (req, res) => {
       titulo,
       mensaje,
       prioridad = 'NORMAL',
-      tipo_destino = 'TODOS',
+      tipo_destino,
+      destino_tipo,
       destino_rol = null,
       id_sucursal = null,
       id_usuario_destino = null,
@@ -200,19 +423,39 @@ export const crearAlerta = async (req, res) => {
     if (!titulo || !titulo.trim()) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'El título de la alerta es obligatorio',
+        mensaje: 'El título de la alerta es obligatorio.',
       });
     }
 
     if (!mensaje || !mensaje.trim()) {
       return res.status(400).json({
         ok: false,
-        mensaje: 'El mensaje de la alerta es obligatorio',
+        mensaje: 'El mensaje de la alerta es obligatorio.',
       });
     }
 
+    /*
+     * destino_tipo se conserva como compatibilidad con versiones antiguas
+     * del frontend. La propiedad oficial es tipo_destino.
+     */
     const prioridadNormalizada = normalizarPrioridad(prioridad);
-    const tipoDestinoNormalizado = normalizarTipoDestino(tipo_destino);
+    const tipoDestinoNormalizado = normalizarTipoDestino(
+      tipo_destino ?? destino_tipo ?? 'TODOS'
+    );
+
+    const destinoRolNormalizado = normalizarRolDestino(destino_rol);
+    const idSucursalDestino = normalizarIdSucursal(id_sucursal);
+    const idUsuarioDestino = id_usuario_destino
+      ? Number(id_usuario_destino)
+      : null;
+
+    await validarDestinoAlerta({
+      req,
+      tipoDestino: tipoDestinoNormalizado,
+      destinoRol: destinoRolNormalizado,
+      idSucursalDestino,
+      idUsuarioDestino,
+    });
 
     const resultado = await pool.query(
       `
@@ -228,36 +471,45 @@ export const crearAlerta = async (req, res) => {
         id_usuario_destino
       )
       VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
-      RETURNING *
+      RETURNING *;
       `,
       [
         titulo.trim(),
         mensaje.trim(),
         prioridadNormalizada,
-        destino_rol ? String(destino_rol).toUpperCase() : null,
-        id_sucursal ? Number(id_sucursal) : null,
-        req.usuario.id_usuario,
+        ['ROL', 'ROL_SUCURSAL'].includes(tipoDestinoNormalizado)
+          ? destinoRolNormalizado
+          : null,
+        ['SUCURSAL', 'ROL_SUCURSAL'].includes(tipoDestinoNormalizado)
+          ? idSucursalDestino
+          : null,
+        obtenerIdUsuario(req.usuario),
         tipoDestinoNormalizado,
-        id_usuario_destino ? Number(id_usuario_destino) : null,
+        tipoDestinoNormalizado === 'USUARIO' ? idUsuarioDestino : null,
       ]
     );
 
     return res.status(201).json({
       ok: true,
-      mensaje: 'Alerta creada correctamente',
+      mensaje: 'Alerta creada correctamente.',
       alerta: resultado.rows[0],
     });
   } catch (error) {
     console.error('Error al crear alerta:', error);
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      mensaje: 'Error interno al crear alerta',
-      error: error.message,
+      mensaje: error.message || 'Error interno al crear alerta.',
     });
   }
 };
 
+/**
+ * Historial administrativo global.
+ *
+ * Esta ruta debe utilizarse solo en la pantalla administrativa de alertas,
+ * no en la campana de notificaciones de los usuarios.
+ */
 export const listarAlertas = async (req, res) => {
   try {
     const resultado = await pool.query(
@@ -276,16 +528,19 @@ export const listarAlertas = async (req, res) => {
         u.nombre AS usuario_creador,
         a.activa,
         a.fecha_creacion,
-        COUNT(al.id_lectura) AS total_lecturas
+        COUNT(al.id_lectura)::int AS total_lecturas
       FROM alertas a
-      LEFT JOIN sucursales s ON s.id_sucursal = a.id_sucursal
-      LEFT JOIN usuarios u ON u.id_usuario = a.id_usuario_creador
-      LEFT JOIN alertas_lecturas al ON al.id_alerta = a.id_alerta
+      LEFT JOIN sucursales s
+        ON s.id_sucursal = a.id_sucursal
+      LEFT JOIN usuarios u
+        ON u.id_usuario = a.id_usuario_creador
+      LEFT JOIN alertas_lecturas al
+        ON al.id_alerta = a.id_alerta
       GROUP BY
         a.id_alerta,
         s.nombre,
         u.nombre
-      ORDER BY a.fecha_creacion DESC
+      ORDER BY a.fecha_creacion DESC;
       `
     );
 
@@ -298,18 +553,20 @@ export const listarAlertas = async (req, res) => {
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al listar alertas',
-      error: error.message,
+      mensaje: 'Error interno al listar alertas.',
     });
   }
 };
 
+/**
+ * Alertas de la campana del usuario actual.
+ *
+ * El frontend debe enviar la sucursal que el usuario tiene activa:
+ * GET /alertas/mis-alertas?id_sucursal=2
+ */
 export const listarMisAlertas = async (req, res) => {
   try {
-    const idUsuario = req.usuario.id_usuario;
-    const rolUsuario = obtenerRolUsuario(req.usuario);
-    const sucursalesUsuario = await obtenerSucursalesUsuario(req.usuario);
-    const esSuperAdmin = rolUsuario === 'SUPER_ADMIN';
+    const contexto = await obtenerContextoAlertas(req);
 
     const resultado = await pool.query(
       `
@@ -324,12 +581,13 @@ export const listarMisAlertas = async (req, res) => {
         a.id_usuario_destino,
         s.nombre AS sucursal,
         a.fecha_creacion,
-        CASE 
+        CASE
           WHEN al.id_lectura IS NULL THEN false
           ELSE true
         END AS leida
       FROM alertas a
-      LEFT JOIN sucursales s ON s.id_sucursal = a.id_sucursal
+      LEFT JOIN sucursales s
+        ON s.id_sucursal = a.id_sucursal
       LEFT JOIN alertas_lecturas al
         ON al.id_alerta = a.id_alerta
        AND al.id_usuario = $1
@@ -338,13 +596,13 @@ export const listarMisAlertas = async (req, res) => {
       ORDER BY
         leida ASC,
         a.fecha_creacion DESC
-      LIMIT 50
+      LIMIT 50;
       `,
       [
-        idUsuario,
-        rolUsuario,
-        esSuperAdmin,
-        sucursalesUsuario,
+        contexto.idUsuario,
+        contexto.rolUsuario,
+        contexto.esSuperAdmin,
+        contexto.idSucursalActiva,
         DIAS_HISTORIAL_ALERTAS,
       ]
     );
@@ -352,25 +610,28 @@ export const listarMisAlertas = async (req, res) => {
     return res.json({
       ok: true,
       dias_historial: DIAS_HISTORIAL_ALERTAS,
+      id_sucursal_activa: contexto.idSucursalActiva,
       alertas: resultado.rows,
     });
   } catch (error) {
     console.error('Error al listar mis alertas:', error);
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      mensaje: 'Error interno al listar mis alertas',
-      error: error.message,
+      mensaje: error.message || 'Error interno al listar mis alertas.',
     });
   }
 };
 
+/**
+ * Contador para la campana del usuario actual.
+ *
+ * El frontend debe enviar la sucursal que el usuario tiene activa:
+ * GET /alertas/no-leidas?id_sucursal=2
+ */
 export const contarAlertasNoLeidas = async (req, res) => {
   try {
-    const idUsuario = req.usuario.id_usuario;
-    const rolUsuario = obtenerRolUsuario(req.usuario);
-    const sucursalesUsuario = await obtenerSucursalesUsuario(req.usuario);
-    const esSuperAdmin = rolUsuario === 'SUPER_ADMIN';
+    const contexto = await obtenerContextoAlertas(req);
 
     const resultado = await pool.query(
       `
@@ -381,61 +642,70 @@ export const contarAlertasNoLeidas = async (req, res) => {
        AND al.id_usuario = $1
       WHERE ${construirFiltroAlertasUsuario()}
         AND al.id_lectura IS NULL
-        ${construirFiltroHistorialReciente()}
+        ${construirFiltroHistorialReciente()};
       `,
       [
-        idUsuario,
-        rolUsuario,
-        esSuperAdmin,
-        sucursalesUsuario,
+        contexto.idUsuario,
+        contexto.rolUsuario,
+        contexto.esSuperAdmin,
+        contexto.idSucursalActiva,
         DIAS_HISTORIAL_ALERTAS,
       ]
     );
 
     return res.json({
       ok: true,
+      id_sucursal_activa: contexto.idSucursalActiva,
       total: resultado.rows[0]?.total || 0,
     });
   } catch (error) {
     console.error('Error al contar alertas no leídas:', error);
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      mensaje: 'Error interno al contar alertas no leídas',
-      error: error.message,
+      mensaje: error.message || 'Error interno al contar alertas no leídas.',
     });
   }
 };
 
 export const marcarAlertaComoLeida = async (req, res) => {
   try {
-    const { id } = req.params;
-    const idUsuario = req.usuario.id_usuario;
+    const idAlerta = Number(req.params.id);
 
-    const rolUsuario = obtenerRolUsuario(req.usuario);
-    const sucursalesUsuario = await obtenerSucursalesUsuario(req.usuario);
-    const esSuperAdmin = rolUsuario === 'SUPER_ADMIN';
+    if (!Number.isInteger(idAlerta) || idAlerta <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la alerta no es válido.',
+      });
+    }
+
+    const contexto = await obtenerContextoAlertas(req);
 
     const alertaExiste = await pool.query(
       `
       SELECT a.id_alerta
       FROM alertas a
       WHERE a.id_alerta = $1
-        AND ${construirFiltroAlertasUsuario()}
+        AND ${construirFiltroAlertasUsuario({
+          idUsuarioParam: '$2',
+          rolUsuarioParam: '$3',
+          esSuperAdminParam: '$4',
+          idSucursalActivaParam: '$5',
+        })};
       `,
       [
-        id,
-        rolUsuario,
-        esSuperAdmin,
-        sucursalesUsuario,
-        DIAS_HISTORIAL_ALERTAS,
+        idAlerta,
+        contexto.idUsuario,
+        contexto.rolUsuario,
+        contexto.esSuperAdmin,
+        contexto.idSucursalActiva,
       ]
     );
 
     if (alertaExiste.rows.length === 0) {
       return res.status(404).json({
         ok: false,
-        mensaje: 'Alerta no encontrada o no corresponde a tu usuario',
+        mensaje: 'La alerta no existe o no corresponde a tu usuario y sucursal.',
       });
     }
 
@@ -446,32 +716,28 @@ export const marcarAlertaComoLeida = async (req, res) => {
         id_usuario
       )
       VALUES ($1, $2)
-      ON CONFLICT (id_alerta, id_usuario) DO NOTHING
+      ON CONFLICT (id_alerta, id_usuario) DO NOTHING;
       `,
-      [id, idUsuario]
+      [idAlerta, contexto.idUsuario]
     );
 
     return res.json({
       ok: true,
-      mensaje: 'Alerta marcada como leída',
+      mensaje: 'Alerta marcada como leída.',
     });
   } catch (error) {
     console.error('Error al marcar alerta como leída:', error);
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      mensaje: 'Error interno al marcar alerta como leída',
-      error: error.message,
+      mensaje: error.message || 'Error interno al marcar alerta como leída.',
     });
   }
 };
 
 export const marcarTodasAlertasComoLeidas = async (req, res) => {
   try {
-    const idUsuario = req.usuario.id_usuario;
-    const rolUsuario = obtenerRolUsuario(req.usuario);
-    const sucursalesUsuario = await obtenerSucursalesUsuario(req.usuario);
-    const esSuperAdmin = rolUsuario === 'SUPER_ADMIN';
+    const contexto = await obtenerContextoAlertas(req);
 
     await pool.query(
       `
@@ -489,56 +755,64 @@ export const marcarTodasAlertasComoLeidas = async (req, res) => {
       WHERE ${construirFiltroAlertasUsuario()}
         AND al.id_lectura IS NULL
         ${construirFiltroHistorialReciente()}
-      ON CONFLICT (id_alerta, id_usuario) DO NOTHING
+      ON CONFLICT (id_alerta, id_usuario) DO NOTHING;
       `,
       [
-        idUsuario,
-        rolUsuario,
-        esSuperAdmin,
-        sucursalesUsuario,
+        contexto.idUsuario,
+        contexto.rolUsuario,
+        contexto.esSuperAdmin,
+        contexto.idSucursalActiva,
         DIAS_HISTORIAL_ALERTAS,
       ]
     );
 
     return res.json({
       ok: true,
-      mensaje: 'Alertas recientes marcadas como leídas',
+      mensaje: 'Alertas recientes de la sucursal activa marcadas como leídas.',
     });
   } catch (error) {
     console.error('Error al marcar todas las alertas como leídas:', error);
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      mensaje: 'Error interno al marcar todas las alertas como leídas',
-      error: error.message,
+      mensaje:
+        error.message ||
+        'Error interno al marcar todas las alertas como leídas.',
     });
   }
 };
 
 export const desactivarAlerta = async (req, res) => {
   try {
-    const { id } = req.params;
+    const idAlerta = Number(req.params.id);
+
+    if (!Number.isInteger(idAlerta) || idAlerta <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la alerta no es válido.',
+      });
+    }
 
     const resultado = await pool.query(
       `
       UPDATE alertas
       SET activa = false
       WHERE id_alerta = $1
-      RETURNING *
+      RETURNING *;
       `,
-      [id]
+      [idAlerta]
     );
 
     if (resultado.rows.length === 0) {
       return res.status(404).json({
         ok: false,
-        mensaje: 'Alerta no encontrada',
+        mensaje: 'Alerta no encontrada.',
       });
     }
 
     return res.json({
       ok: true,
-      mensaje: 'Alerta desactivada correctamente',
+      mensaje: 'Alerta desactivada correctamente.',
       alerta: resultado.rows[0],
     });
   } catch (error) {
@@ -546,8 +820,7 @@ export const desactivarAlerta = async (req, res) => {
 
     return res.status(500).json({
       ok: false,
-      mensaje: 'Error interno al desactivar alerta',
-      error: error.message,
+      mensaje: 'Error interno al desactivar alerta.',
     });
   }
 };

@@ -1,4 +1,6 @@
 import { pool } from '../config/db.js';
+import fs from 'fs';
+import path from 'path';
 
 const obtenerIdUsuarioAutenticado = (req) => {
   return Number(req.usuario?.id_usuario || req.usuario?.id || 0);
@@ -21,6 +23,101 @@ const esUsuarioCajeroOAdmin = (req) => {
     rolUsuario === 'ADMIN_SUCURSAL' ||
     rolUsuario === 'SUPER_ADMIN'
   );
+};
+
+
+export const subirLogoUniversidadDoctor = async (req, res) => {
+  try {
+    const idUsuario =
+      req.usuario?.id_usuario ||
+      req.usuario?.id ||
+      req.user?.id_usuario ||
+      req.user?.id;
+
+    if (!idUsuario) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: 'No se pudo identificar al usuario autenticado.',
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'Debes seleccionar una imagen.',
+      });
+    }
+
+    const logoUniversidadUrl = `/uploads/doctor-shaddai/logos-universidad/${req.file.filename}`;
+
+    /*
+      IMPORTANTE:
+      Cambia doctores_shaddai_perfiles por el nombre real de tu tabla
+      si en tu proyecto se llama diferente.
+    */
+    const perfilActual = await pool.query(
+      `
+        SELECT logo_universidad_url
+        FROM doctores_shaddai_perfiles
+        WHERE id_usuario = $1
+        LIMIT 1
+      `,
+      [idUsuario]
+    );
+
+    if (perfilActual.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró el perfil del doctor.',
+      });
+    }
+
+    const result = await pool.query(
+      `
+        UPDATE doctores_shaddai_perfiles
+        SET
+          logo_universidad_url = $1,
+          fecha_actualizacion = NOW()
+        WHERE id_usuario = $2
+        RETURNING *
+      `,
+      [logoUniversidadUrl, idUsuario]
+    );
+
+    const logoAnterior = perfilActual.rows[0]?.logo_universidad_url;
+
+    if (
+      logoAnterior &&
+      logoAnterior.startsWith('/uploads/doctor-shaddai/logos-universidad/')
+    ) {
+      const rutaAnterior = path.resolve(
+        process.cwd(),
+        logoAnterior.replace(/^\/uploads\//, 'uploads/')
+      );
+
+      fs.unlink(rutaAnterior, (error) => {
+        if (error && error.code !== 'ENOENT') {
+          console.warn('No se pudo eliminar el logo anterior:', error.message);
+        }
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Logo de universidad actualizado correctamente.',
+      logo_universidad_url: logoUniversidadUrl,
+      perfil: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al subir logo de universidad:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje:
+        error.message ||
+        'No se pudo subir el logo de universidad.',
+    });
+  }
 };
 
 const limpiarTexto = (valor) => {
@@ -901,6 +998,88 @@ export const actualizarMiPerfilDoctorShaddai = async (req, res) => {
   }
 };
 
+
+/**
+ * Normaliza el tipo de detalle de receta.
+ *
+ * INVENTARIO: medicamento ligado a un producto del catálogo; puede tener
+ * existencia o no al momento de la prescripción.
+ *
+ * LIBRE: medicamento prescrito por el doctor que no existe en el inventario.
+ * No debe agregarse automáticamente a una venta ni descontar existencias.
+ */
+const normalizarTipoProductoReceta = (producto = {}) => {
+  const tipoSolicitado = String(
+    producto.tipo_producto_receta || ''
+  )
+    .trim()
+    .toUpperCase();
+
+  const productoLibre =
+    limpiarBooleano(producto.producto_libre) ||
+    tipoSolicitado === 'LIBRE' ||
+    (!producto.id_producto && tipoSolicitado !== 'INVENTARIO');
+
+  return productoLibre ? 'LIBRE' : 'INVENTARIO';
+};
+
+const normalizarDisponibleInventario = (
+  producto = {},
+  tipoProductoReceta = 'INVENTARIO'
+) => {
+  if (tipoProductoReceta === 'LIBRE') {
+    return false;
+  }
+
+  const valor = producto.disponible_inventario;
+
+  if (valor === undefined || valor === null || valor === '') {
+    return Number(producto.stock || 0) > 0;
+  }
+
+  return limpiarBooleano(valor);
+};
+
+const normalizarProductoReceta = (producto = {}) => {
+  const tipoProductoReceta = normalizarTipoProductoReceta(producto);
+  const productoLibre = tipoProductoReceta === 'LIBRE';
+
+  const cantidad = limpiarNumero(producto.cantidad);
+  const stockCapturado = Math.max(0, Number(producto.stock || 0));
+  const precioCapturado = Math.max(0, Number(producto.precio || 0));
+
+  return {
+    id_producto: productoLibre ? null : limpiarNumero(producto.id_producto),
+    id_sucursal: productoLibre ? null : limpiarNumero(producto.id_sucursal),
+
+    tipo_producto_receta: tipoProductoReceta,
+    producto_libre: productoLibre,
+    disponible_inventario: normalizarDisponibleInventario(
+      producto,
+      tipoProductoReceta
+    ),
+
+    nombre: limpiarTexto(producto.nombre),
+    nombre_generico: limpiarTexto(producto.nombre_generico),
+    forma_farmaceutica: limpiarTexto(producto.forma_farmaceutica),
+    presentacion: limpiarTexto(producto.presentacion),
+    codigo_barras: productoLibre ? null : limpiarTexto(producto.codigo_barras),
+
+    sucursal: productoLibre ? null : limpiarTexto(producto.sucursal),
+    lote: productoLibre ? null : limpiarTexto(producto.lote),
+    fecha_caducidad: productoLibre ? null : producto.fecha_caducidad || null,
+
+    cantidad,
+    stock: productoLibre ? 0 : stockCapturado,
+    precio: productoLibre ? 0 : precioCapturado,
+
+    dosis: limpiarTexto(producto.dosis),
+    frecuencia: limpiarTexto(producto.frecuencia),
+    duracion: limpiarTexto(producto.duracion),
+    indicaciones: limpiarTexto(producto.indicaciones),
+  };
+};
+
 /**
  * Generar folio de receta
  */
@@ -946,8 +1125,6 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
     } = req.body;
 
     if (!idDoctor) {
-      client.release();
-
       return res.status(401).json({
         ok: false,
         mensaje: 'No se pudo identificar al doctor autenticado.',
@@ -955,17 +1132,13 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
     }
 
     if (!paciente) {
-      client.release();
-
       return res.status(400).json({
         ok: false,
         mensaje: 'Los datos del paciente son obligatorios.',
       });
     }
 
-    if (!paciente.nombre_paciente || !paciente.nombre_paciente.trim()) {
-      client.release();
-
+    if (!limpiarTexto(paciente.nombre_paciente)) {
       return res.status(400).json({
         ok: false,
         mensaje: 'El nombre del paciente es obligatorio.',
@@ -973,28 +1146,40 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
     }
 
     if (!Array.isArray(productos) || productos.length === 0) {
-      client.release();
-
       return res.status(400).json({
         ok: false,
-        mensaje: 'La receta debe contener al menos un producto.',
+        mensaje: 'La receta debe contener al menos un medicamento.',
       });
     }
 
-    const productosInvalidos = productos.filter((producto) => {
-      return (
-        !producto.nombre ||
-        !producto.cantidad ||
-        Number(producto.cantidad) <= 0
-      );
+    /*
+      La receta es una prescripción clínica, por lo que puede contener:
+      - Productos del inventario, incluso sin existencia actual.
+      - Medicamentos libres, que no están en el catálogo de la farmacia.
+    */
+    const productosNormalizados = productos.map(normalizarProductoReceta);
+
+    const productosInvalidos = productosNormalizados.filter((producto) => {
+      if (!producto.nombre || !producto.cantidad || producto.cantidad <= 0) {
+        return true;
+      }
+
+      // Un producto de inventario siempre debe conservar su referencia.
+      if (
+        producto.tipo_producto_receta === 'INVENTARIO' &&
+        !producto.id_producto
+      ) {
+        return true;
+      }
+
+      return false;
     });
 
     if (productosInvalidos.length > 0) {
-      client.release();
-
       return res.status(400).json({
         ok: false,
-        mensaje: 'Todos los productos deben tener nombre y cantidad válida.',
+        mensaje:
+          'Todos los medicamentos deben tener nombre y cantidad válida. Los productos de inventario deben conservar su identificador.',
       });
     }
 
@@ -1084,6 +1269,15 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
       id_sucursal
     );
 
+    if (!idSucursalFinal) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'No se pudo determinar la sucursal donde se generará la receta.',
+      });
+    }
+
     const diagnosticoFinal =
       limpiarTexto(diagnostico) ||
       limpiarTexto(paciente?.diagnostico) ||
@@ -1100,6 +1294,7 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
       INSERT INTO recetas_shaddai (
         id_doctor,
         id_paciente_expediente,
+        id_sucursal,
         nombre_paciente,
         telefono_paciente,
         edad_paciente,
@@ -1110,7 +1305,7 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
         folio_receta
       )
       VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, 'PENDIENTE_CAJERO', $9
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDIENTE_CAJERO', $10
       )
       RETURNING *;
     `;
@@ -1118,10 +1313,11 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
     const valuesReceta = [
       idDoctor,
       id_paciente_expediente || null,
-      paciente.nombre_paciente.trim(),
-      paciente.telefono?.trim() || null,
-      paciente.edad ? Number(paciente.edad) : null,
-      paciente.sexo || null,
+      idSucursalFinal,
+      limpiarTexto(paciente.nombre_paciente),
+      limpiarTexto(paciente.telefono),
+      limpiarNumero(paciente.edad),
+      limpiarTexto(paciente.sexo),
       diagnosticoFinal,
       observacionesFinal,
       folioReceta,
@@ -1132,7 +1328,7 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
 
     const detallesInsertados = [];
 
-    for (const producto of productos) {
+    for (const producto of productosNormalizados) {
       const queryDetalle = `
         INSERT INTO recetas_shaddai_detalle (
           id_receta,
@@ -1149,37 +1345,54 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
           frecuencia,
           duracion,
           indicaciones,
-          precio_unitario
+          precio_unitario,
+          tipo_producto_receta,
+          producto_libre,
+          disponible_inventario
         )
         VALUES (
           $1, $2, $3, $4, $5,
           $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15
+          $11, $12, $13, $14, $15,
+          $16, $17, $18
         )
         RETURNING *;
       `;
 
       const valuesDetalle = [
         receta.id_receta,
-        producto.id_producto || null,
-        producto.id_sucursal || null,
+        producto.id_producto,
+        producto.id_sucursal,
         producto.nombre,
-        producto.codigo_barras || null,
-        producto.sucursal || null,
-        producto.lote || null,
-        producto.fecha_caducidad || null,
-        Number(producto.cantidad),
-        producto.stock ? Number(producto.stock) : 0,
-        producto.dosis?.trim() || null,
-        producto.frecuencia?.trim() || null,
-        producto.duracion?.trim() || null,
-        producto.indicaciones?.trim() || null,
-        producto.precio ? Number(producto.precio) : 0,
+        producto.codigo_barras,
+        producto.sucursal,
+        producto.lote,
+        producto.fecha_caducidad,
+        producto.cantidad,
+        producto.stock,
+        producto.dosis,
+        producto.frecuencia,
+        producto.duracion,
+        producto.indicaciones,
+        producto.precio,
+        producto.tipo_producto_receta,
+        producto.producto_libre,
+        producto.disponible_inventario,
       ];
 
       const detalleResult = await client.query(queryDetalle, valuesDetalle);
       detallesInsertados.push(detalleResult.rows[0]);
     }
+
+    const totalMedicamentosLibres = detallesInsertados.filter(
+      (detalle) =>
+        detalle.producto_libre === true ||
+        detalle.tipo_producto_receta === 'LIBRE' ||
+        !detalle.id_producto
+    ).length;
+
+    const totalProductosInventario =
+      detallesInsertados.length - totalMedicamentosLibres;
 
     const documentoClinico = await registrarDocumentoClinico(client, {
       id_expediente: id_paciente_expediente || null,
@@ -1205,6 +1418,8 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
         diagnostico: diagnosticoFinal,
         observaciones: observacionesFinal,
         total_productos: detallesInsertados.length,
+        total_productos_inventario: totalProductosInventario,
+        total_medicamentos_libres: totalMedicamentosLibres,
         total_piezas: detallesInsertados.reduce(
           (total, item) => total + Number(item.cantidad || 0),
           0
@@ -1240,6 +1455,7 @@ export const crearRecetaDoctorShaddai = async (req, res) => {
     client.release();
   }
 };
+
 
 /**
  * Generar folio de servicio clínico
@@ -1923,12 +2139,19 @@ export const cancelarServicioClinicoDoctorShaddai = async (req, res) => {
  */
 export const listarRecetasDoctorShaddai = async (req, res) => {
   try {
-    const { estatus, busqueda } = req.query;
+    const { estatus, busqueda, id_sucursal } = req.query;
 
     const filtros = [];
     const valores = [];
 
     filtros.push('r.activo = true');
+
+    const idSucursalFiltro = limpiarNumero(id_sucursal);
+
+    if (idSucursalFiltro) {
+      valores.push(idSucursalFiltro);
+      filtros.push(`r.id_sucursal = $${valores.length}`);
+    }
 
     const idUsuario = obtenerIdUsuarioAutenticado(req);
     const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
@@ -1974,6 +2197,7 @@ export const listarRecetasDoctorShaddai = async (req, res) => {
         r.id_receta,
         r.id_doctor,
         r.id_paciente_expediente,
+        r.id_sucursal,
         r.nombre_paciente,
         r.telefono_paciente,
         r.edad_paciente,
@@ -1986,6 +2210,9 @@ export const listarRecetasDoctorShaddai = async (req, res) => {
         r.activo,
         r.folio_receta,
         r.fecha_surtida,
+        r.fecha_finalizacion,
+        r.finalizada_por,
+        r.motivo_finalizacion,
 
         dsp.nombre_completo AS nombre_doctor,
         dsp.nombre_completo AS nombre_doctor_shaddai,
@@ -1993,6 +2220,16 @@ export const listarRecetasDoctorShaddai = async (req, res) => {
         dsp.especialidad,
 
         COUNT(rd.id_detalle)::int AS total_productos,
+        COUNT(rd.id_detalle) FILTER (
+          WHERE COALESCE(rd.producto_libre, false) = true
+             OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+             OR rd.id_producto IS NULL
+        )::int AS total_medicamentos_libres,
+        COUNT(rd.id_detalle) FILTER (
+          WHERE rd.id_producto IS NOT NULL
+            AND COALESCE(rd.producto_libre, false) = false
+            AND COALESCE(rd.tipo_producto_receta, 'INVENTARIO') <> 'LIBRE'
+        )::int AS total_productos_inventario,
         COALESCE(SUM(rd.cantidad), 0)::numeric AS total_piezas
 
       FROM recetas_shaddai r
@@ -2057,7 +2294,7 @@ export const obtenerRecetaDoctorShaddaiPorId = async (req, res) => {
         dsp.correo AS correo_doctor,
         dsp.direccion_consultorio
       FROM recetas_shaddai r
-      LEFT JOIN usuarios u 
+      LEFT JOIN usuarios u
         ON u.id_usuario = r.id_doctor
       LEFT JOIN doctores_shaddai_perfiles dsp
         ON dsp.id_usuario = r.id_doctor
@@ -2094,24 +2331,61 @@ export const obtenerRecetaDoctorShaddaiPorId = async (req, res) => {
         rd.duracion,
         rd.indicaciones,
         rd.precio_unitario,
+
+        COALESCE(rd.tipo_producto_receta, 'INVENTARIO') AS tipo_producto_receta,
+        COALESCE(rd.producto_libre, false) AS producto_libre,
+        COALESCE(rd.disponible_inventario, true) AS disponible_inventario,
+
+        CASE
+          WHEN COALESCE(rd.producto_libre, false) = true
+            OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+            OR rd.id_producto IS NULL
+          THEN false
+          ELSE true
+        END AS surtible_desde_inventario,
+
+        CASE
+          WHEN COALESCE(rd.producto_libre, false) = true
+            OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+            OR rd.id_producto IS NULL
+          THEN 'Medicamento libre / no registrado en inventario.'
+          ELSE NULL
+        END AS motivo_no_surtible,
+
         rd.activo,
         rd.fecha_creacion,
 
         COALESCE(SUM(vd.cantidad), 0)::numeric AS cantidad_surtida,
 
-        GREATEST(
-          rd.cantidad - COALESCE(SUM(vd.cantidad), 0),
-          0
-        )::numeric AS cantidad_pendiente,
+        CASE
+          WHEN COALESCE(rd.producto_libre, false) = true
+            OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+            OR rd.id_producto IS NULL
+          THEN 0::numeric
+          ELSE GREATEST(
+            rd.cantidad - COALESCE(SUM(vd.cantidad), 0),
+            0
+          )::numeric
+        END AS cantidad_pendiente,
 
         CASE
-          WHEN COALESCE(SUM(vd.cantidad), 0) >= rd.cantidad THEN true
+          WHEN COALESCE(rd.producto_libre, false) = true
+            OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+            OR rd.id_producto IS NULL
+          THEN false
+          WHEN COALESCE(SUM(vd.cantidad), 0) >= rd.cantidad
+          THEN true
           ELSE false
         END AS surtido_completo,
 
         CASE
+          WHEN COALESCE(rd.producto_libre, false) = true
+            OR COALESCE(rd.tipo_producto_receta, 'INVENTARIO') = 'LIBRE'
+            OR rd.id_producto IS NULL
+          THEN false
           WHEN COALESCE(SUM(vd.cantidad), 0) > 0
-           AND COALESCE(SUM(vd.cantidad), 0) < rd.cantidad THEN true
+           AND COALESCE(SUM(vd.cantidad), 0) < rd.cantidad
+          THEN true
           ELSE false
         END AS surtido_parcial
 
@@ -2137,6 +2411,9 @@ export const obtenerRecetaDoctorShaddaiPorId = async (req, res) => {
         rd.duracion,
         rd.indicaciones,
         rd.precio_unitario,
+        rd.tipo_producto_receta,
+        rd.producto_libre,
+        rd.disponible_inventario,
         rd.activo,
         rd.fecha_creacion
       ORDER BY rd.id_detalle ASC;
@@ -2159,6 +2436,7 @@ export const obtenerRecetaDoctorShaddaiPorId = async (req, res) => {
     });
   }
 };
+
 
 /**
  * Cancelar receta Doctor Shaddai
@@ -2211,6 +2489,241 @@ export const cancelarRecetaDoctorShaddai = async (req, res) => {
       mensaje: 'Error al cancelar la receta.',
       error: error.message,
     });
+  }
+};
+
+
+/**
+ * Finalizar receta desde caja sin generar una venta adicional.
+ *
+ * - FINALIZADA_SIN_SURTIR: no hay piezas vendidas.
+ * - FINALIZADA_PARCIAL: existen piezas vendidas, pero quedaron pendientes
+ *   o la receta contiene medicamentos libres/no surtibles desde inventario.
+ * - SURTIDA: todos los detalles surtibles fueron cubiertos y no hay
+ *   medicamentos libres pendientes.
+ */
+export const finalizarRecetaDoctorShaddai = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+    const { motivo_finalizacion = null } = req.body || {};
+    const idUsuario = obtenerIdUsuarioAutenticado(req);
+
+    /* if (!esUsuarioCajeroOAdmin(req)) {
+       return res.status(403).json({
+         ok: false,
+         mensaje: 'No tienes permiso para finalizar recetas desde caja.',
+       });
+     }*/
+
+    if (!id || Number.isNaN(Number(id))) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la receta no es válido.',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const recetaResult = await client.query(
+      `
+      SELECT
+        id_receta,
+        folio_receta,
+        estatus,
+        activo
+      FROM recetas_shaddai
+      WHERE id_receta = $1
+        AND activo = true
+      FOR UPDATE;
+      `,
+      [Number(id)]
+    );
+
+    if (recetaResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró la receta.',
+      });
+    }
+
+    const recetaActual = recetaResult.rows[0];
+    const estatusActual = String(recetaActual.estatus || '').toUpperCase();
+
+    if (estatusActual === 'CANCELADA') {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'No se puede finalizar una receta cancelada.',
+      });
+    }
+
+    if (
+      ['FINALIZADA_SIN_SURTIR', 'FINALIZADA_PARCIAL'].includes(estatusActual)
+    ) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La receta ya se encuentra finalizada.',
+      });
+    }
+
+    const detalleResult = await client.query(
+      `
+      SELECT
+        rd.id_detalle,
+        rd.id_producto,
+        rd.cantidad,
+        COALESCE(rd.tipo_producto_receta, 'INVENTARIO') AS tipo_producto_receta,
+        COALESCE(rd.producto_libre, false) AS producto_libre,
+        COALESCE(SUM(vd.cantidad), 0)::numeric AS cantidad_surtida
+      FROM recetas_shaddai_detalle rd
+      LEFT JOIN venta_detalle vd
+        ON vd.id_detalle_receta_shaddai = rd.id_detalle
+      WHERE rd.id_receta = $1
+        AND rd.activo = true
+      GROUP BY
+        rd.id_detalle,
+        rd.id_producto,
+        rd.cantidad,
+        rd.tipo_producto_receta,
+        rd.producto_libre
+      ORDER BY rd.id_detalle ASC;
+      `,
+      [Number(id)]
+    );
+
+    const detalles = detalleResult.rows;
+
+    const esDetalleSurtible = (detalle) => {
+      const tipo = String(detalle.tipo_producto_receta || 'INVENTARIO')
+        .trim()
+        .toUpperCase();
+
+      return (
+        tipo !== 'LIBRE' &&
+        detalle.producto_libre !== true &&
+        detalle.producto_libre !== 'true' &&
+        Number(detalle.id_producto || 0) > 0
+      );
+    };
+
+    const detallesSurtibles = detalles.filter(esDetalleSurtible);
+    const hayDetallesNoSurtibles = detalles.some(
+      (detalle) => !esDetalleSurtible(detalle)
+    );
+
+    const huboSurtido = detalles.some(
+      (detalle) => Number(detalle.cantidad_surtida || 0) > 0
+    );
+
+    const todosLosSurtiblesCompletos =
+      detallesSurtibles.length > 0 &&
+      detallesSurtibles.every(
+        (detalle) =>
+          Number(detalle.cantidad_surtida || 0) >=
+          Number(detalle.cantidad || 0)
+      );
+
+    let estatusFinal = 'FINALIZADA_SIN_SURTIR';
+
+    if (todosLosSurtiblesCompletos && !hayDetallesNoSurtibles) {
+      estatusFinal = 'SURTIDA';
+    } else if (huboSurtido) {
+      estatusFinal = 'FINALIZADA_PARCIAL';
+    }
+
+    const motivoFinal =
+      limpiarTexto(motivo_finalizacion) ||
+      (estatusFinal === 'SURTIDA'
+        ? 'Receta finalizada desde caja con surtido completo.'
+        : estatusFinal === 'FINALIZADA_PARCIAL'
+          ? 'Receta finalizada desde caja con surtido parcial.'
+          : 'Receta finalizada desde caja sin surtirse.');
+
+    const recetaSeSurtioCompleta = estatusFinal === 'SURTIDA';
+
+    const actualizarReceta = await client.query(
+      `
+  UPDATE recetas_shaddai
+  SET
+    estatus = $1,
+    fecha_surtida = CASE
+      WHEN $5 = true THEN COALESCE(fecha_surtida, NOW())
+      ELSE fecha_surtida
+    END,
+    fecha_finalizacion = NOW(),
+    finalizada_por = $2,
+    motivo_finalizacion = $3,
+    fecha_actualizacion = NOW()
+  WHERE id_receta = $4
+    AND activo = true
+  RETURNING *;
+  `,
+      [
+        estatusFinal,
+        idUsuario || null,
+        motivoFinal,
+        Number(id),
+        recetaSeSurtioCompleta,
+      ]
+    );
+    await client.query(
+      `
+      UPDATE documentos_clinicos
+      SET
+        estatus = $1,
+        fecha_actualizacion = NOW()
+      WHERE tabla_origen = 'recetas_shaddai'
+        AND id_origen = $2;
+      `,
+      [estatusFinal, Number(id)]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      mensaje:
+        estatusFinal === 'SURTIDA'
+          ? 'La receta se finalizó como surtida.'
+          : estatusFinal === 'FINALIZADA_PARCIAL'
+            ? 'La receta se finalizó con surtido parcial.'
+            : 'La receta se finalizó sin surtirse.',
+      receta: actualizarReceta.rows[0],
+      resumen: {
+        total_detalles: detalles.length,
+        detalles_surtibles: detallesSurtibles.length,
+        detalles_no_surtibles: detalles.filter(
+          (detalle) => !esDetalleSurtible(detalle)
+        ).length,
+        hubo_surtido: huboSurtido,
+      },
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error(
+        'Error al hacer rollback al finalizar receta:',
+        rollbackError
+      );
+    }
+
+    console.error('Error al finalizar receta Doctor Shaddai:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'Error interno al finalizar la receta.',
+      error: error.message,
+    });
+  } finally {
+    client.release();
   }
 };
 
@@ -2345,12 +2858,16 @@ export const surtirRecetaDoctorShaddai = async (req, res) => {
 
     const receta = recetaResultado.rows[0];
 
-    if (receta.estatus === 'CANCELADA') {
+    if (
+      ['CANCELADA', 'FINALIZADA_SIN_SURTIR', 'FINALIZADA_PARCIAL'].includes(
+        String(receta.estatus || '').toUpperCase()
+      )
+    ) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
         ok: false,
-        mensaje: 'No se puede surtir una receta cancelada.',
+        mensaje: 'La receta ya fue finalizada y no puede volver a surtirse desde caja.',
       });
     }
 
@@ -2665,6 +3182,353 @@ export const actualizarServicioClinicoCatalogo = async (req, res) => {
     });
   }
 };
+
+
+const obtenerIdUsuarioRequest = (req) => {
+  return (
+    req.usuario?.id_usuario ||
+    req.usuario?.id ||
+    req.user?.id_usuario ||
+    req.user?.id ||
+    null
+  );
+};
+
+const obtenerIdSucursalRequest = (req) => {
+  return (
+    req.usuario?.id_sucursal ||
+    req.usuario?.sucursal?.id_sucursal ||
+    req.user?.id_sucursal ||
+    null
+  );
+};
+
+const normalizarTexto = (valor) => {
+  if (valor === undefined || valor === null) return null;
+
+  const texto = String(valor).trim();
+
+  return texto || null;
+};
+
+const normalizarNumero = (valor) => {
+  if (valor === undefined || valor === null || valor === '') return null;
+
+  const numero = Number(valor);
+
+  return Number.isFinite(numero) ? numero : null;
+};
+
+const normalizarJson = (valor) => {
+  if (!valor || typeof valor !== 'object') return {};
+
+  return valor;
+};
+
+const obtenerFechaCompacta = () => {
+  const ahora = new Date();
+
+  const year = ahora.getFullYear();
+  const month = String(ahora.getMonth() + 1).padStart(2, '0');
+  const day = String(ahora.getDate()).padStart(2, '0');
+
+  return `${year}${month}${day}`;
+};
+
+const generarFolioCertificado = async (client) => {
+  const fecha = obtenerFechaCompacta();
+  const prefijo = `CERT-${fecha}`;
+
+  const { rows } = await client.query(
+    `
+      SELECT folio_certificado
+      FROM certificados_medicos_shaddai
+      WHERE folio_certificado LIKE $1
+      ORDER BY id_certificado DESC
+      LIMIT 1
+    `,
+    [`${prefijo}-%`]
+  );
+
+  let consecutivo = 1;
+
+  if (rows.length > 0) {
+    const ultimoFolio = rows[0].folio_certificado || '';
+    const partes = ultimoFolio.split('-');
+    const ultimoNumero = Number(partes[2] || 0);
+
+    if (Number.isFinite(ultimoNumero)) {
+      consecutivo = ultimoNumero + 1;
+    }
+  }
+
+  return `${prefijo}-${String(consecutivo).padStart(4, '0')}`;
+};
+
+export const crearCertificadoMedico = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      id_expediente,
+      id_fila,
+      id_sucursal,
+      tipo_atencion,
+
+      tipo_certificado,
+      folio_certificado,
+
+      lugar_expedicion,
+      fecha_expedicion,
+      destinatario,
+      finalidad,
+
+      estado_salud,
+      antecedentes,
+      exploracion_fisica,
+      conclusion,
+      observaciones,
+      texto_libre,
+
+      datos_paciente,
+      datos_doctor,
+    } = req.body;
+
+    if (!id_expediente) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El id_expediente es obligatorio para guardar el certificado.',
+      });
+    }
+
+    if (!tipo_certificado) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El tipo de certificado es obligatorio.',
+      });
+    }
+
+    if (!estado_salud || !String(estado_salud).trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El estado de salud es obligatorio.',
+      });
+    }
+
+    if (!conclusion || !String(conclusion).trim()) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La conclusión del certificado es obligatoria.',
+      });
+    }
+
+    const idDoctor = obtenerIdUsuarioRequest(req);
+
+    if (!idDoctor) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: 'No se pudo identificar al doctor autenticado.',
+      });
+    }
+
+    const idSucursalFinal =
+      normalizarNumero(id_sucursal) ||
+      normalizarNumero(datos_paciente?.id_sucursal) ||
+      obtenerIdSucursalRequest(req);
+
+    await client.query('BEGIN');
+
+    const folioFinal =
+      normalizarTexto(folio_certificado) ||
+      (await generarFolioCertificado(client));
+
+    const sql = `
+      INSERT INTO certificados_medicos_shaddai (
+        id_expediente,
+        id_fila,
+        id_sucursal,
+        id_doctor,
+        tipo_atencion,
+        tipo_certificado,
+        folio_certificado,
+        lugar_expedicion,
+        fecha_expedicion,
+        destinatario,
+        finalidad,
+        estado_salud,
+        antecedentes,
+        exploracion_fisica,
+        conclusion,
+        observaciones,
+        texto_libre,
+        datos_paciente,
+        datos_doctor,
+        estatus,
+        activo
+      )
+      VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15,
+        $16, $17, $18::jsonb, $19::jsonb,
+        'ACTIVO', TRUE
+      )
+      RETURNING *
+    `;
+
+    const params = [
+      normalizarNumero(id_expediente),
+      normalizarNumero(id_fila),
+      idSucursalFinal,
+      idDoctor,
+      normalizarTexto(tipo_atencion),
+
+      normalizarTexto(tipo_certificado),
+      folioFinal,
+      normalizarTexto(lugar_expedicion),
+      fecha_expedicion || null,
+      normalizarTexto(destinatario),
+
+      normalizarTexto(finalidad),
+      normalizarTexto(estado_salud),
+      normalizarTexto(antecedentes),
+      normalizarTexto(exploracion_fisica),
+      normalizarTexto(conclusion),
+
+      normalizarTexto(observaciones),
+      normalizarTexto(texto_libre),
+      JSON.stringify(normalizarJson(datos_paciente)),
+      JSON.stringify(normalizarJson(datos_doctor)),
+    ];
+
+
+
+    const { rows } = await client.query(sql, params);
+    const certificado = rows[0];
+
+    const datosPacienteFinal = normalizarJson(datos_paciente);
+    const datosDoctorFinal = normalizarJson(datos_doctor);
+
+    const documentoClinico = await registrarDocumentoClinico(client, {
+      id_expediente: certificado.id_expediente,
+      id_fila: certificado.id_fila,
+      id_doctor: certificado.id_doctor || idDoctor,
+      id_sucursal: certificado.id_sucursal || idSucursalFinal,
+
+      tipo_documento: 'CERTIFICADO_MEDICO',
+      id_origen: certificado.id_certificado,
+      folio: certificado.folio_certificado,
+      titulo: 'Certificado médico',
+      descripcion:
+        normalizarTexto(certificado.finalidad) ||
+        normalizarTexto(certificado.estado_salud) ||
+        normalizarTexto(certificado.conclusion) ||
+        'Certificado médico',
+
+      estatus: certificado.estatus || 'ACTIVO',
+      tabla_origen: 'certificados_medicos_shaddai',
+
+      ruta_frontend: `/app/doctor-shaddai/recetas?id_expediente=${certificado.id_expediente}${certificado.id_fila ? `&id_fila=${certificado.id_fila}` : ''
+        }&tipo_atencion=${certificado.tipo_atencion || 'CONSULTA_MEDICA'}`,
+
+      metadata: {
+        id_certificado: certificado.id_certificado,
+        folio_certificado: certificado.folio_certificado,
+        tipo_certificado: certificado.tipo_certificado,
+
+        lugar_expedicion: certificado.lugar_expedicion,
+        fecha_expedicion: certificado.fecha_expedicion,
+        destinatario: certificado.destinatario,
+        finalidad: certificado.finalidad,
+
+        estado_salud: certificado.estado_salud,
+        antecedentes: certificado.antecedentes,
+        exploracion_fisica: certificado.exploracion_fisica,
+        conclusion: certificado.conclusion,
+        observaciones: certificado.observaciones,
+        texto_libre: certificado.texto_libre,
+
+        datos_paciente: certificado.datos_paciente || datosPacienteFinal,
+        datos_doctor: certificado.datos_doctor || datosDoctorFinal,
+
+        nombre_paciente:
+          datosPacienteFinal.nombre_paciente ||
+          certificado.datos_paciente?.nombre_paciente ||
+          null,
+
+        edad:
+          datosPacienteFinal.edad ||
+          certificado.datos_paciente?.edad ||
+          null,
+
+        sexo:
+          datosPacienteFinal.sexo ||
+          certificado.datos_paciente?.sexo ||
+          null,
+
+        fecha_nacimiento:
+          datosPacienteFinal.fecha_nacimiento ||
+          certificado.datos_paciente?.fecha_nacimiento ||
+          null,
+
+        telefono:
+          datosPacienteFinal.telefono ||
+          certificado.datos_paciente?.telefono ||
+          null,
+
+        doctor_nombre_completo:
+          datosDoctorFinal.nombre_completo ||
+          certificado.datos_doctor?.nombre_completo ||
+          null,
+
+        cedula_profesional:
+          datosDoctorFinal.cedula_profesional ||
+          certificado.datos_doctor?.cedula_profesional ||
+          null,
+
+        especialidad:
+          datosDoctorFinal.especialidad ||
+          certificado.datos_doctor?.especialidad ||
+          null,
+
+        logo_universidad_url:
+          datosDoctorFinal.logo_universidad_url ||
+          certificado.datos_doctor?.logo_universidad_url ||
+          null,
+      },
+    });
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Certificado médico guardado correctamente.',
+      certificado,
+      documento_clinico: documentoClinico,
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Error al crear certificado médico:', error);
+
+    if (error.code === '23505') {
+      return res.status(409).json({
+        ok: false,
+        mensaje: 'Ya existe un certificado con ese folio. Intenta guardar nuevamente.',
+      });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo guardar el certificado médico.',
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+};
+
 
 export const cambiarEstatusServicioClinicoCatalogo = async (req, res) => {
   try {

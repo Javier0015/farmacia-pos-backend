@@ -27,9 +27,16 @@ import {
   cancelarServicioClinicoDoctorShaddai,
 
   obtenerNotaMedicaPorId,
+  crearCertificadoMedico,
+
+  finalizarRecetaDoctorShaddai,
+
 } from '../controllers/doctorShaddai.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
+
+import { uploadLogoUniversidadDoctor } from '../middlewares/uploadLogoUniversidadDoctor.js';
+import { subirLogoUniversidadDoctor } from '../controllers/doctorShaddai.controller.js';
 
 const router = Router();
 
@@ -101,6 +108,21 @@ router.put(
   verificarToken,
   cancelarServicioClinicoDoctorShaddai
 );
+
+router.post(
+  '/mi-perfil/logo-universidad',
+  uploadLogoUniversidadDoctor.single('logo_universidad'),
+  verificarToken,
+  subirLogoUniversidadDoctor
+);
+
+router.put(
+  '/recetas/:id/finalizar',
+  finalizarRecetaDoctorShaddai
+);
+
+
+router.post('/certificados', verificarToken, crearCertificadoMedico);
 
 /* Notas médicas */
 router.get('/notas-medicas/:idNota', verificarToken, obtenerNotaMedicaPorId);
