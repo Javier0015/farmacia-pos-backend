@@ -11,18 +11,158 @@ const obtenerRolUsuarioAutenticado = (req) => {
     req.usuario?.rol ||
     req.usuario?.nombre_rol ||
     req.usuario?.tipo_usuario ||
+    req.usuario?.rol_usuario ||
     ''
-  ).toUpperCase();
+  )
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_');
+};
+
+const esSuperAdministrador = (req) => {
+  const rolUsuario = obtenerRolUsuarioAutenticado(req);
+
+  return rolUsuario === 'SUPER_ADMIN' || rolUsuario === 'SUPERADMIN';
 };
 
 const esUsuarioCajeroOAdmin = (req) => {
   const rolUsuario = obtenerRolUsuarioAutenticado(req);
 
-  return (
-    rolUsuario === 'CAJERO' ||
-    rolUsuario === 'ADMIN_SUCURSAL' ||
-    rolUsuario === 'SUPER_ADMIN'
-  );
+  return [
+    'CAJERO',
+    'CAJA',
+    'ADMIN_SUCURSAL',
+    'ADMINISTRADOR_SUCURSAL',
+    'ADMINISTRADOR',
+    'ADMIN',
+    'SUPER_ADMIN',
+    'SUPERADMIN',
+  ].includes(rolUsuario);
+};
+
+const normalizarIdSucursal = (valor) => {
+  if (valor === undefined || valor === null || String(valor).trim() === '') {
+    return null;
+  }
+
+  const idSucursal = Number(valor);
+
+  return Number.isInteger(idSucursal) && idSucursal > 0
+    ? idSucursal
+    : null;
+};
+
+const obtenerSucursalesDesdeToken = (usuario = {}) => {
+  const ids = [];
+
+  const posiblesIds = [
+    usuario.id_sucursal,
+    usuario.sucursal_id,
+    usuario.idSucursal,
+    usuario.sucursal?.id_sucursal,
+    usuario.sucursal?.id,
+  ];
+
+  posiblesIds.forEach((valor) => {
+    const idSucursal = normalizarIdSucursal(valor);
+
+    if (idSucursal) {
+      ids.push(idSucursal);
+    }
+  });
+
+  const sucursales =
+    usuario.sucursales ||
+    usuario.sucursales_asignadas ||
+    usuario.sucursalesAsignadas ||
+    usuario.sucursales_ids ||
+    [];
+
+  if (Array.isArray(sucursales)) {
+    sucursales.forEach((sucursal) => {
+      const valor =
+        typeof sucursal === 'number' || typeof sucursal === 'string'
+          ? sucursal
+          : sucursal?.id_sucursal ||
+            sucursal?.id ||
+            sucursal?.sucursal_id;
+
+      const idSucursal = normalizarIdSucursal(valor);
+
+      if (idSucursal) {
+        ids.push(idSucursal);
+      }
+    });
+  }
+
+  return [...new Set(ids)];
+};
+
+const obtenerSucursalesAsignadasUsuario = async (req) => {
+  const idUsuario = obtenerIdUsuarioAutenticado(req);
+  const ids = new Set(obtenerSucursalesDesdeToken(req.usuario));
+
+  if (!idUsuario) {
+    return [...ids];
+  }
+
+  const consultas = [
+    `
+      SELECT id_sucursal
+      FROM usuario_sucursales
+      WHERE id_usuario = $1
+        AND COALESCE(activo, true) = true
+    `,
+    `
+      SELECT id_sucursal
+      FROM usuarios_sucursales
+      WHERE id_usuario = $1
+    `,
+    `
+      SELECT id_sucursal
+      FROM usuarios
+      WHERE id_usuario = $1
+        AND id_sucursal IS NOT NULL
+    `,
+  ];
+
+  for (const consulta of consultas) {
+    try {
+      const { rows } = await pool.query(consulta, [idUsuario]);
+
+      rows.forEach((row) => {
+        const idSucursal = normalizarIdSucursal(row.id_sucursal);
+
+        if (idSucursal) {
+          ids.add(idSucursal);
+        }
+      });
+    } catch (error) {
+      // El proyecto puede utilizar solo una de estas tablas de asignación.
+    }
+  }
+
+  return [...ids].sort((a, b) => a - b);
+};
+
+const obtenerIdSucursalSolicitada = (req) => {
+  const valor = req.query?.id_sucursal ?? req.body?.id_sucursal ?? null;
+
+  if (valor === undefined || valor === null || String(valor).trim() === '') {
+    return null;
+  }
+
+  return normalizarIdSucursal(valor);
+};
+
+const validarAccesoSucursalServicio = async (req, idSucursal) => {
+  if (!idSucursal || esSuperAdministrador(req)) {
+    return true;
+  }
+
+  const sucursalesPermitidas = await obtenerSucursalesAsignadasUsuario(req);
+
+  return sucursalesPermitidas.includes(Number(idSucursal));
 };
 
 
@@ -1633,6 +1773,16 @@ export const crearServicioClinicoDoctorShaddai = async (req, res) => {
       id_sucursal
     );
 
+    if (!idSucursalFinal) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'No se pudo determinar la sucursal donde se generará el servicio clínico.',
+      });
+    }
+
     const diagnosticoFinal =
       limpiarTexto(diagnostico) ||
       limpiarTexto(paciente?.diagnostico) ||
@@ -1855,18 +2005,61 @@ export const crearServicioClinicoDoctorShaddai = async (req, res) => {
 
 /**
  * Listar servicios clínicos Doctor Shaddai
+ *
+ * Para caja y administradores de sucursal, id_sucursal es obligatorio:
+ * GET /doctor-shaddai/servicios-clinicos?estatus=PENDIENTE_CAJERO&id_sucursal=2
+ *
+ * Esto evita que una caja visualice servicios generados en otra sucursal.
  */
 export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
   try {
-    const { estatus, busqueda } = req.query;
+    const { estatus, busqueda, id_sucursal } = req.query;
 
-    const filtros = [];
-    const valores = [];
+    const seEnvioSucursal =
+      id_sucursal !== undefined &&
+      id_sucursal !== null &&
+      String(id_sucursal).trim() !== '';
 
-    filtros.push('s.activo = true');
+    const idSucursalFiltro = normalizarIdSucursal(id_sucursal);
+
+    if (seEnvioSucursal && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La sucursal seleccionada no es válida.',
+      });
+    }
 
     const idUsuario = obtenerIdUsuarioAutenticado(req);
     const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+    const esSuperAdmin = esSuperAdministrador(req);
+
+    if (esCajeroOAdmin && !esSuperAdmin && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Debes indicar la sucursal activa para consultar servicios clínicos desde caja.',
+      });
+    }
+
+    if (
+      idSucursalFiltro &&
+      esCajeroOAdmin &&
+      !esSuperAdmin &&
+      !(await validarAccesoSucursalServicio(req, idSucursalFiltro))
+    ) {
+      return res.status(403).json({
+        ok: false,
+        mensaje: 'No tienes acceso a la sucursal seleccionada.',
+      });
+    }
+
+    const filtros = ['s.activo = true'];
+    const valores = [];
+
+    if (idSucursalFiltro) {
+      valores.push(idSucursalFiltro);
+      filtros.push(`s.id_sucursal = $${valores.length}`);
+    }
 
     if (!esCajeroOAdmin) {
       valores.push(idUsuario);
@@ -1897,11 +2090,12 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
           OR s.observaciones ILIKE $${valores.length}
           OR dsp.nombre_completo ILIKE $${valores.length}
           OR dsp.especialidad ILIKE $${valores.length}
+          OR su.nombre ILIKE $${valores.length}
         )
       `);
     }
 
-    const where = filtros.length > 0 ? `WHERE ${filtros.join(' AND ')}` : '';
+    const where = `WHERE ${filtros.join(' AND ')}`;
 
     const resultado = await pool.query(
       `
@@ -1926,6 +2120,8 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
         s.fecha_realizado,
         s.activo,
 
+        su.nombre AS nombre_sucursal,
+
         dsp.nombre_completo AS nombre_doctor,
         dsp.nombre_completo AS nombre_doctor_shaddai,
         dsp.cedula_profesional,
@@ -1935,6 +2131,8 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
         COALESCE(SUM(sd.cantidad), 0)::numeric AS total_cantidad
 
       FROM servicios_clinicos_solicitudes s
+      LEFT JOIN sucursales su
+        ON su.id_sucursal = s.id_sucursal
       LEFT JOIN doctores_shaddai_perfiles dsp
         ON dsp.id_usuario = s.id_doctor
        AND dsp.activo = true
@@ -1944,6 +2142,7 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
       ${where}
       GROUP BY
         s.id_solicitud_servicio,
+        su.nombre,
         dsp.nombre_completo,
         dsp.cedula_profesional,
         dsp.especialidad
@@ -1954,6 +2153,7 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
 
     return res.json({
       ok: true,
+      id_sucursal: idSucursalFiltro || null,
       servicios: resultado.rows,
     });
   } catch (error) {
@@ -1968,17 +2168,61 @@ export const listarServiciosClinicosDoctorShaddai = async (req, res) => {
 };
 
 /**
- * Obtener servicio clínico Doctor Shaddai por ID
+ * Obtener servicio clínico Doctor Shaddai por ID.
+ *
+ * La caja debe enviar la sucursal activa:
+ * GET /doctor-shaddai/servicios-clinicos/:id?id_sucursal=2
  */
 export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
   try {
     const { id } = req.params;
+    const { id_sucursal } = req.query;
+
+    const seEnvioSucursal =
+      id_sucursal !== undefined &&
+      id_sucursal !== null &&
+      String(id_sucursal).trim() !== '';
+
+    const idSucursalFiltro = normalizarIdSucursal(id_sucursal);
+
+    if (seEnvioSucursal && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La sucursal seleccionada no es válida.',
+      });
+    }
 
     const idUsuario = obtenerIdUsuarioAutenticado(req);
     const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+    const esSuperAdmin = esSuperAdministrador(req);
+
+    if (esCajeroOAdmin && !esSuperAdmin && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Debes indicar la sucursal activa para consultar el detalle del servicio desde caja.',
+      });
+    }
+
+    if (
+      idSucursalFiltro &&
+      esCajeroOAdmin &&
+      !esSuperAdmin &&
+      !(await validarAccesoSucursalServicio(req, idSucursalFiltro))
+    ) {
+      return res.status(403).json({
+        ok: false,
+        mensaje: 'No tienes acceso a la sucursal seleccionada.',
+      });
+    }
 
     const filtros = ['s.id_solicitud_servicio = $1', 's.activo = true'];
     const valores = [id];
+
+    if (idSucursalFiltro) {
+      valores.push(idSucursalFiltro);
+      filtros.push(`s.id_sucursal = $${valores.length}`);
+    }
 
     if (!esCajeroOAdmin) {
       valores.push(idUsuario);
@@ -1989,6 +2233,7 @@ export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
       `
       SELECT
         s.*,
+        su.nombre AS nombre_sucursal,
         u.nombre AS nombre_doctor_usuario,
         dsp.nombre_completo AS nombre_doctor,
         dsp.cedula_profesional,
@@ -1997,6 +2242,8 @@ export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
         dsp.correo AS correo_doctor,
         dsp.direccion_consultorio
       FROM servicios_clinicos_solicitudes s
+      LEFT JOIN sucursales su
+        ON su.id_sucursal = s.id_sucursal
       LEFT JOIN usuarios u
         ON u.id_usuario = s.id_doctor
       LEFT JOIN doctores_shaddai_perfiles dsp
@@ -2011,7 +2258,8 @@ export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
     if (solicitudResult.rows.length === 0) {
       return res.status(404).json({
         ok: false,
-        mensaje: 'Servicio clínico no encontrado o no tienes permiso para verlo.',
+        mensaje:
+          'Servicio clínico no encontrado o no corresponde a la sucursal seleccionada.',
       });
     }
 
@@ -2066,21 +2314,69 @@ export const obtenerServicioClinicoDoctorShaddaiPorId = async (req, res) => {
 };
 
 /**
- * Cancelar servicio clínico Doctor Shaddai
+ * Cancelar servicio clínico Doctor Shaddai.
+ *
+ * Un doctor conserva la cancelación de sus propios servicios. Para caja o
+ * administración se exige la sucursal activa como protección adicional.
  */
 export const cancelarServicioClinicoDoctorShaddai = async (req, res) => {
   try {
     const { id } = req.params;
+    const { id_sucursal } = req.query;
+
+    const seEnvioSucursal =
+      id_sucursal !== undefined &&
+      id_sucursal !== null &&
+      String(id_sucursal).trim() !== '';
+
+    const idSucursalFiltro = normalizarIdSucursal(id_sucursal);
+
+    if (seEnvioSucursal && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La sucursal seleccionada no es válida.',
+      });
+    }
 
     const idUsuario = obtenerIdUsuarioAutenticado(req);
     const esCajeroOAdmin = esUsuarioCajeroOAdmin(req);
+    const esSuperAdmin = esSuperAdministrador(req);
+
+    if (esCajeroOAdmin && !esSuperAdmin && !idSucursalFiltro) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Debes indicar la sucursal activa para cancelar un servicio desde caja.',
+      });
+    }
+
+    if (
+      idSucursalFiltro &&
+      esCajeroOAdmin &&
+      !esSuperAdmin &&
+      !(await validarAccesoSucursalServicio(req, idSucursalFiltro))
+    ) {
+      return res.status(403).json({
+        ok: false,
+        mensaje: 'No tienes acceso a la sucursal seleccionada.',
+      });
+    }
 
     const valores = [id];
-    let filtroPropietario = '';
+    const filtros = [
+      'id_solicitud_servicio = $1',
+      'activo = true',
+      `estatus NOT IN ('PAGADO', 'REALIZADO', 'CANCELADO')`,
+    ];
+
+    if (idSucursalFiltro) {
+      valores.push(idSucursalFiltro);
+      filtros.push(`id_sucursal = $${valores.length}`);
+    }
 
     if (!esCajeroOAdmin) {
       valores.push(idUsuario);
-      filtroPropietario = `AND id_doctor = $${valores.length}`;
+      filtros.push(`id_doctor = $${valores.length}`);
     }
 
     const resultado = await pool.query(
@@ -2089,10 +2385,7 @@ export const cancelarServicioClinicoDoctorShaddai = async (req, res) => {
       SET
         estatus = 'CANCELADO',
         fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_solicitud_servicio = $1
-        AND activo = true
-        AND estatus NOT IN ('PAGADO', 'REALIZADO', 'CANCELADO')
-        ${filtroPropietario}
+      WHERE ${filtros.join(' AND ')}
       RETURNING *;
       `,
       valores
@@ -2102,7 +2395,7 @@ export const cancelarServicioClinicoDoctorShaddai = async (req, res) => {
       return res.status(404).json({
         ok: false,
         mensaje:
-          'Servicio clínico no encontrado, ya fue cobrado/realizado o no tienes permiso para cancelarlo.',
+          'Servicio clínico no encontrado, ya fue cobrado/realizado o no corresponde a tu sucursal.',
       });
     }
 
