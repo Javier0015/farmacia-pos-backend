@@ -6,9 +6,7 @@ import { pool } from '../config/db.js';
 
 const REPORTES_CAJA_DIR = path.join(process.cwd(), 'uploads', 'reportes-caja');
 
-// Logo usado dentro del PDF.
-// En tu estructura actual está en: backend/src/assets/logoShaddai.png
-// Se dejan rutas alternativas para que no falle si después mueves el servidor.
+
 const LOGO_SHADDAI_PATHS = [
   path.join(process.cwd(), 'src', 'assets', 'logoShaddai.png'),
   path.join(process.cwd(), 'assets', 'logoShaddai.png'),
@@ -30,7 +28,7 @@ const obtenerLogoReporteBase64 = async () => {
 
       return `data:${mimeType};base64,${bufferLogo.toString('base64')}`;
     } catch {
-      // Intenta con la siguiente ruta.
+
     }
   }
 
@@ -49,13 +47,22 @@ const formatoMonedaMXN = (valor) => {
   });
 };
 
+const ZONA_HORARIA_SISTEMA = 'America/Mexico_City';
+
 const formatoFechaMX = (fecha) => {
   if (!fecha) return '—';
 
-  return new Date(fecha).toLocaleString('es-MX', {
+  const fechaObj = fecha instanceof Date ? fecha : new Date(fecha);
+
+  if (Number.isNaN(fechaObj.getTime())) {
+    return '—';
+  }
+
+  return new Intl.DateTimeFormat('es-MX', {
     dateStyle: 'medium',
     timeStyle: 'short',
-  });
+    timeZone: ZONA_HORARIA_SISTEMA,
+  }).format(fechaObj);
 };
 
 const escapeHtml = (valor) => {
@@ -746,6 +753,10 @@ const generarReporteCierreCajaPDF = async ({ idSesion, idUsuario }) => {
 
   try {
     const page = await browser.newPage();
+
+    // Respaldo para cualquier fecha que se formatee dentro del navegador.
+    await page.emulateTimezone(ZONA_HORARIA_SISTEMA);
+
     await page.setContent(html, { waitUntil: 'networkidle0' });
     await page.pdf({
       path: rutaAbsoluta,
