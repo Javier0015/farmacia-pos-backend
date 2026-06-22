@@ -47,6 +47,35 @@ const calcularIMC = (pesoKg, tallaCm) => {
   return Number((peso / (tallaMetros * tallaMetros)).toFixed(2));
 };
 
+const TIPOS_NOTA_VALIDOS = new Set([
+  'NOTA_INICIAL',
+  'NOTA_EVOLUCION',
+]);
+
+const normalizarTipoNota = (valor) => {
+  const tipo = String(valor || '').trim().toUpperCase();
+
+  return TIPOS_NOTA_VALIDOS.has(tipo)
+    ? tipo
+    : 'NOTA_INICIAL';
+};
+
+const normalizarTipoNotaOpcional = (valor) => {
+  if (valor === undefined || valor === null || String(valor).trim() === '') {
+    return null;
+  }
+
+  const tipo = String(valor).trim().toUpperCase();
+
+  return TIPOS_NOTA_VALIDOS.has(tipo) ? tipo : null;
+};
+
+const obtenerTituloTipoNota = (tipoNota) => {
+  return normalizarTipoNota(tipoNota) === 'NOTA_EVOLUCION'
+    ? 'Nota de evolución'
+    : 'Nota médica inicial';
+};
+
 const registrarDocumentoClinico = async (
   client,
   {
@@ -123,6 +152,7 @@ export const crearNotaMedica = async (req, res) => {
       id_expediente,
       id_fila,
       id_sucursal,
+      tipo_nota,
 
       antecedentes_padecimiento_actual,
       exploracion_fisica,
@@ -155,6 +185,7 @@ export const crearNotaMedica = async (req, res) => {
     const idExpedienteFinal = normalizarIdEntero(id_expediente);
     const idFilaFinal = normalizarIdEntero(id_fila);
     const idSucursalBodyFinal = normalizarIdEntero(id_sucursal);
+    const tipoNotaFinal = normalizarTipoNota(tipo_nota);
 
     if (!idExpedienteFinal) {
       return res.status(400).json({
@@ -305,6 +336,7 @@ export const crearNotaMedica = async (req, res) => {
         id_fila,
         id_doctor,
         id_sucursal,
+        tipo_nota,
 
         antecedentes_padecimiento_actual,
         exploracion_fisica,
@@ -325,10 +357,10 @@ export const crearNotaMedica = async (req, res) => {
         saturacion_oxigeno
       )
       VALUES (
-        $1, $2, $3, $4,
-        $5, $6, $7, $8, $9, $10,
-        $11, $12,
-        $13, $14, $15, $16, $17, $18, $19
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, $10, $11,
+        $12, $13,
+        $14, $15, $16, $17, $18, $19, $20
       )
       RETURNING *;
     `;
@@ -338,6 +370,7 @@ export const crearNotaMedica = async (req, res) => {
       idFilaFinal,
       Number(idDoctor),
       idSucursalFinal,
+      tipoNotaFinal,
 
       normalizarTexto(antecedentes_padecimiento_actual),
       normalizarTexto(exploracion_fisica),
@@ -370,7 +403,7 @@ export const crearNotaMedica = async (req, res) => {
       tipo_documento: 'NOTA_MEDICA',
       id_origen: nota.id_nota,
       folio: `NOTA-${nota.id_nota}`,
-      titulo: 'Nota médica',
+      titulo: obtenerTituloTipoNota(nota.tipo_nota),
       descripcion:
         normalizarTexto(diagnostico) ||
         normalizarTexto(motivo_consulta) ||
@@ -378,11 +411,11 @@ export const crearNotaMedica = async (req, res) => {
       estatus: 'GENERADA',
 
       tabla_origen: 'notas_medicas',
-      ruta_frontend: `/app/doctor-shaddai/recetas?id_expediente=${idExpedienteFinal}&id_fila=${
-        idFilaFinal || ''
-      }&tipo_atencion=CONSULTA_MEDICA`,
+      ruta_frontend: `/app/doctor-shaddai/recetas?id_expediente=${idExpedienteFinal}&id_fila=${idFilaFinal || ''
+        }&tipo_atencion=CONSULTA_MEDICA`,
 
       metadata: {
+        tipo_nota: nota.tipo_nota,
         motivo_consulta: nota.motivo_consulta,
         diagnostico: nota.diagnostico,
         pronostico: nota.pronostico,
@@ -599,11 +632,14 @@ export const obtenerNotaMedicaPorId = async (req, res) => {
 };
 
 export const actualizarNotaMedica = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { idNota } = req.params;
     const idNotaFinal = normalizarIdEntero(idNota);
 
     const {
+      tipo_nota,
       antecedentes_padecimiento_actual,
       exploracion_fisica,
       plan,
@@ -630,36 +666,43 @@ export const actualizarNotaMedica = async (req, res) => {
       });
     }
 
+    const tipoNotaOpcional = normalizarTipoNotaOpcional(tipo_nota);
     const imcFinal = normalizarNumero(imc) || calcularIMC(peso_kg, talla_cm);
+
+    await client.query('BEGIN');
 
     const query = `
       UPDATE notas_medicas
       SET
-        antecedentes_padecimiento_actual = $1,
-        exploracion_fisica = $2,
-        plan = $3,
-        pronostico = $4,
-        pasa_a = $5,
-        observaciones = $6,
+        tipo_nota = COALESCE($1, tipo_nota),
 
-        motivo_consulta = $7,
-        diagnostico = $8,
+        antecedentes_padecimiento_actual = $2,
+        exploracion_fisica = $3,
+        plan = $4,
+        pronostico = $5,
+        pasa_a = $6,
+        observaciones = $7,
 
-        peso_kg = $9,
-        talla_cm = $10,
-        imc = $11,
-        presion_arterial = $12,
-        frecuencia_cardiaca = $13,
-        temperatura = $14,
-        saturacion_oxigeno = $15,
+        motivo_consulta = $8,
+        diagnostico = $9,
+
+        peso_kg = $10,
+        talla_cm = $11,
+        imc = $12,
+        presion_arterial = $13,
+        frecuencia_cardiaca = $14,
+        temperatura = $15,
+        saturacion_oxigeno = $16,
 
         fecha_actualizacion = NOW()
-      WHERE id_nota = $16
+      WHERE id_nota = $17
         AND activo = true
       RETURNING *;
     `;
 
     const values = [
+      tipoNotaOpcional,
+
       normalizarTexto(antecedentes_padecimiento_actual),
       normalizarTexto(exploracion_fisica),
       normalizarTexto(plan),
@@ -681,21 +724,57 @@ export const actualizarNotaMedica = async (req, res) => {
       idNotaFinal,
     ];
 
-    const { rows } = await pool.query(query, values);
+    const { rows } = await client.query(query, values);
 
     if (rows.length === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'La nota médica no existe o está inactiva.',
       });
     }
 
+    const nota = rows[0];
+
+    await client.query(
+      `
+      UPDATE documentos_clinicos
+      SET
+        titulo = $1,
+        descripcion = COALESCE($2, descripcion),
+        metadata = jsonb_set(
+          COALESCE(metadata, '{}'::jsonb),
+          '{tipo_nota}',
+          to_jsonb($3::text),
+          true
+        ),
+        fecha_actualizacion = NOW()
+      WHERE tabla_origen = 'notas_medicas'
+        AND id_origen = $4;
+      `,
+      [
+        obtenerTituloTipoNota(nota.tipo_nota),
+        nota.diagnostico || nota.motivo_consulta || null,
+        nota.tipo_nota,
+        nota.id_nota,
+      ]
+    );
+
+    await client.query('COMMIT');
+
     return res.json({
       ok: true,
       mensaje: 'Nota médica actualizada correctamente.',
-      nota: rows[0],
+      nota,
     });
   } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error al hacer ROLLBACK:', rollbackError);
+    }
+
     console.error('Error al actualizar nota médica:', error);
 
     return res.status(500).json({
@@ -703,6 +782,8 @@ export const actualizarNotaMedica = async (req, res) => {
       mensaje: 'Error al actualizar la nota médica.',
       error: error.message,
     });
+  } finally {
+    client.release();
   }
 };
 

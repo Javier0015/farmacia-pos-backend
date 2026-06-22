@@ -1,5 +1,46 @@
 import { pool } from '../config/db.js';
 
+const columnasDocumentoClinico = `
+  dc.id_documento,
+  dc.id_expediente,
+  dc.id_fila,
+  dc.id_doctor,
+  dc.id_sucursal,
+  dc.tipo_documento,
+  dc.id_origen,
+  dc.folio,
+  dc.titulo,
+  dc.descripcion,
+  dc.estatus,
+  dc.tabla_origen,
+  dc.ruta_frontend,
+  dc.metadata,
+  dc.fecha_documento,
+  dc.fecha_creacion,
+  dc.fecha_actualizacion,
+
+  COALESCE(
+    nm.tipo_nota,
+    NULLIF(dc.metadata->>'tipo_nota', ''),
+    NULLIF(dc.metadata->>'tipoNota', ''),
+    NULLIF(dc.metadata->'nota'->>'tipo_nota', ''),
+    CASE
+      WHEN dc.tipo_documento = 'NOTA_EVOLUCION' THEN 'NOTA_EVOLUCION'
+      WHEN dc.titulo ILIKE '%evolución%' THEN 'NOTA_EVOLUCION'
+      ELSE 'NOTA_INICIAL'
+    END
+  ) AS tipo_nota
+`;
+
+const joinNotasMedicas = `
+  LEFT JOIN notas_medicas nm
+    ON nm.id_nota = dc.id_origen
+    AND (
+      dc.tipo_documento IN ('NOTA_MEDICA', 'NOTA_EVOLUCION')
+      OR dc.tabla_origen = 'notas_medicas'
+    )
+`;
+
 export const listarDocumentosClinicosPorAtencion = async (req, res) => {
   try {
     const { id_fila } = req.params;
@@ -14,26 +55,11 @@ export const listarDocumentosClinicosPorAtencion = async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        id_documento,
-        id_expediente,
-        id_fila,
-        id_doctor,
-        id_sucursal,
-        tipo_documento,
-        id_origen,
-        folio,
-        titulo,
-        descripcion,
-        estatus,
-        tabla_origen,
-        ruta_frontend,
-        metadata,
-        fecha_documento,
-        fecha_creacion,
-        fecha_actualizacion
-      FROM documentos_clinicos
-      WHERE id_fila = $1
-      ORDER BY fecha_documento DESC, fecha_creacion DESC
+        ${columnasDocumentoClinico}
+      FROM documentos_clinicos dc
+      ${joinNotasMedicas}
+      WHERE dc.id_fila = $1
+      ORDER BY dc.fecha_documento DESC, dc.fecha_creacion DESC
       `,
       [id_fila]
     );
@@ -67,26 +93,11 @@ export const listarDocumentosClinicosPorExpediente = async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        id_documento,
-        id_expediente,
-        id_fila,
-        id_doctor,
-        id_sucursal,
-        tipo_documento,
-        id_origen,
-        folio,
-        titulo,
-        descripcion,
-        estatus,
-        tabla_origen,
-        ruta_frontend,
-        metadata,
-        fecha_documento,
-        fecha_creacion,
-        fecha_actualizacion
-      FROM documentos_clinicos
-      WHERE id_expediente = $1
-      ORDER BY fecha_documento DESC, fecha_creacion DESC
+        ${columnasDocumentoClinico}
+      FROM documentos_clinicos dc
+      ${joinNotasMedicas}
+      WHERE dc.id_expediente = $1
+      ORDER BY dc.fecha_documento DESC, dc.fecha_creacion DESC
       `,
       [id_expediente]
     );
@@ -113,25 +124,10 @@ export const obtenerDocumentoClinicoPorId = async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        id_documento,
-        id_expediente,
-        id_fila,
-        id_doctor,
-        id_sucursal,
-        tipo_documento,
-        id_origen,
-        folio,
-        titulo,
-        descripcion,
-        estatus,
-        tabla_origen,
-        ruta_frontend,
-        metadata,
-        fecha_documento,
-        fecha_creacion,
-        fecha_actualizacion
-      FROM documentos_clinicos
-      WHERE id_documento = $1
+        ${columnasDocumentoClinico}
+      FROM documentos_clinicos dc
+      ${joinNotasMedicas}
+      WHERE dc.id_documento = $1
       LIMIT 1
       `,
       [id_documento]

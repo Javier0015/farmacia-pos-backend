@@ -1360,7 +1360,7 @@ export const consultarStockSucursales = async (req, res) => {
     if (productoResultado.rows.length === 0) {
       return res.status(404).json({
         ok: false,
-        mensaje: 'No se encontró ningún producto con esa búsqueda',
+        mensaje: 'No se encontró ningún producto con esa búsqueda, puedes agregarlo en el apartado "Medicamento libre"',
       });
     }
 
