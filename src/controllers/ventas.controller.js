@@ -1,4 +1,5 @@
 import { pool } from '../config/db.js';
+import { enviarTicketDigitalVenta } from '../services/ticketDigitalCorreo.service.js';
 
 const generarFolioVenta = () => {
   const fecha = new Date();
@@ -843,6 +844,7 @@ export const crearVenta = async (req, res) => {
       id_tarjeta_puntos,
       id_doctor,
       id_receta_shaddai,
+      enviar_ticket_digital = false,
     } = req.body;
 
     if (!id_sucursal || !id_caja || !id_sesion) {
@@ -918,6 +920,7 @@ export const crearVenta = async (req, res) => {
           id_tarjeta,
           codigo_barras,
           nombre_cliente,
+          correo,
           puntos_actuales,
           puntos_acumulados,
           puntos_canjeados,
@@ -2213,6 +2216,50 @@ const productoResultado = await client.query(
 
     await client.query('COMMIT');
 
+    /*
+     * El envío del ticket digital ocurre después del COMMIT.
+     * Si el correo falla, la venta ya quedó registrada y el error solo se
+     * devuelve como información al POS; nunca se revierte una venta válida.
+     */
+    const tarjetaParaTicketDigital = tarjetaPuntos
+      ? {
+          ...tarjetaPuntos,
+          ...(tarjetaActualizada || {}),
+        }
+      : null;
+
+    const ticketDigital = esValorActivo(enviar_ticket_digital)
+      ? await enviarTicketDigitalVenta({
+          idSucursal: Number(id_sucursal),
+          tarjeta: tarjetaParaTicketDigital,
+          venta,
+          productos: productosProcesados,
+          servicios: serviciosProcesados,
+          pagos: pagosVenta,
+          resumen: {
+            subtotal: subtotalVenta,
+            subtotal_sin_descuento: subtotalSinDescuentoVenta,
+            descuento_ofertas: descuentoOfertasVenta,
+            descuento: descuentoVenta,
+            impuesto: impuestoVenta,
+            total: totalVenta,
+            metodo_pago: metodoPagoFinal,
+            monto_recibido: montoRecibidoFinal,
+            cambio,
+            monto_pagado_dinero: montoPagadoDinero,
+            monto_pagado_puntos: montoPagadoPuntos,
+            puntos_usados: puntosUsados,
+            puntos_ganados: puntosClienteGanados,
+            puntos_ganados_cliente: puntosClienteGanados,
+          },
+        })
+      : {
+          solicitado: false,
+          enviado: false,
+          estatus: 'NO_SOLICITADO',
+          mensaje: 'No se solicitó el envío de ticket digital para esta venta.',
+        };
+
     return res.status(201).json({
       ok: true,
       mensaje: 'Venta registrada correctamente',
@@ -2224,6 +2271,7 @@ const productoResultado = await client.query(
         tarjeta_puntos: tarjetaActualizada,
         doctor_shaddai_puntos: doctorShaddaiPuntos,
         receta_shaddai_actualizada: recetaShaddaiActualizada,
+        ticket_digital: ticketDigital,
       },
       resumen: {
         subtotal: subtotalVenta,
@@ -2246,6 +2294,7 @@ const productoResultado = await client.query(
         doctor_shaddai_puntos: doctorShaddaiPuntos,
         estatus_receta_shaddai: recetaShaddaiActualizada?.estatus || null,
         tarjeta_puntos: tarjetaActualizada,
+        ticket_digital: ticketDigital,
         configuracion_puntos: {
           porcentaje_cliente: configuracionPuntos.porcentaje_cliente,
           porcentaje_cajero: configuracionPuntos.porcentaje_cajero,

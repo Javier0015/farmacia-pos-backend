@@ -34,7 +34,8 @@ import violenciaLesionRoutes from './routes/violenciaLesion.routes.js';
 import consentimientosRoutes from './routes/consentimientos.routes.js';
 import documentosClinicosRoutes from './routes/documentosClinicos.routes.js';
 import controlSanitarioRoutes from './routes/controlSanitario.routes.js';
-
+import configuracionTicketRoutes from './routes/configuracionTicket.routes.js';
+import configuracionCorreoSmtpRoutes from './routes/configuracionCorreoSmtp.routes.js';
 
 const app = express();
 
@@ -100,6 +101,8 @@ app.use('/api/violencia-lesion', violenciaLesionRoutes);
 app.use('/api/consentimientos', consentimientosRoutes);
 app.use('/api/documentos-clinicos', documentosClinicosRoutes);
 app.use('/api/control-sanitario', controlSanitarioRoutes);
+app.use('/api/configuracion-ticket', configuracionTicketRoutes);
+app.use('/api/configuracion-correo-smtp', configuracionCorreoSmtpRoutes);
 
 // Middleware para rutas no encontradas
 app.use((req, res) => {
