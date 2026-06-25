@@ -410,3 +410,204 @@ export const eliminarProductoCatalogo = async (req, res) => {
     });
   }
 };
+
+const convertirBooleano = (valor, valorPorDefecto = false) => {
+  if (typeof valor === 'boolean') return valor;
+
+  if (typeof valor === 'string') {
+    const texto = valor.trim().toLowerCase();
+
+    if (['true', '1', 'on', 'si', 'sí'].includes(texto)) return true;
+    if (['false', '0', 'off', 'no'].includes(texto)) return false;
+  }
+
+  if (typeof valor === 'number') {
+    return valor === 1;
+  }
+
+  return valorPorDefecto;
+};
+
+const normalizarUrlRedSocial = (url) => {
+  const valor = String(url || '').trim();
+
+  if (!valor) return null;
+
+  let urlValidada;
+
+  try {
+    urlValidada = new URL(valor);
+  } catch {
+    throw new Error('El enlace no tiene un formato válido.');
+  }
+
+  if (!['http:', 'https:'].includes(urlValidada.protocol)) {
+    throw new Error('El enlace debe iniciar con http:// o https://');
+  }
+
+  return urlValidada.toString();
+};
+
+/* =========================================================
+   ADMINISTRACIÓN: devuelve todas, activas o inactivas
+========================================================= */
+export const listarRedesSocialesCatalogo = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        id_red_social,
+        clave,
+        nombre,
+        url,
+        activo,
+        orden,
+        fecha_creacion,
+        fecha_actualizacion
+      FROM public.catalogo_redes_sociales
+      ORDER BY orden ASC, nombre ASC
+    `);
+
+    return res.json({
+      ok: true,
+      redes_sociales: rows,
+    });
+  } catch (error) {
+    console.error('Error al listar redes sociales del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudieron cargar las redes sociales.',
+    });
+  }
+};
+
+/* =========================================================
+   ADMINISTRACIÓN: actualiza link, visibilidad y orden
+========================================================= */
+export const actualizarRedSocialCatalogo = async (req, res) => {
+  try {
+    const idRedSocial = Number(req.params.id);
+    const { url, activo, orden } = req.body;
+
+    if (!Number.isInteger(idRedSocial) || idRedSocial <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la red social no es válido.',
+      });
+    }
+
+    let urlNormalizada = null;
+
+    try {
+      urlNormalizada = normalizarUrlRedSocial(url);
+    } catch (errorUrl) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: errorUrl.message,
+      });
+    }
+
+    const activoNormalizado = convertirBooleano(activo, false);
+
+    const ordenNormalizado =
+      orden === '' || orden === null || orden === undefined
+        ? 0
+        : Number(orden);
+
+    if (
+      !Number.isInteger(ordenNormalizado) ||
+      ordenNormalizado < 0
+    ) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El orden debe ser un número entero mayor o igual a cero.',
+      });
+    }
+
+    if (activoNormalizado && !urlNormalizada) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'Para mostrar una red social en el catálogo debes capturar un enlace válido.',
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      UPDATE public.catalogo_redes_sociales
+      SET
+        url = $1,
+        activo = $2,
+        orden = $3,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_red_social = $4
+      RETURNING
+        id_red_social,
+        clave,
+        nombre,
+        url,
+        activo,
+        orden,
+        fecha_creacion,
+        fecha_actualizacion
+      `,
+      [
+        urlNormalizada,
+        activoNormalizado,
+        ordenNormalizado,
+        idRedSocial,
+      ]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'La red social no fue encontrada.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      mensaje: 'Red social actualizada correctamente.',
+      red_social: rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar red social del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo actualizar la red social.',
+    });
+  }
+};
+
+/* =========================================================
+   PÚBLICO: solo devuelve redes activas con enlace válido
+========================================================= */
+export const listarRedesSocialesPublicas = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        clave,
+        nombre,
+        url,
+        orden
+      FROM public.catalogo_redes_sociales
+      WHERE activo = true
+        AND NULLIF(BTRIM(url), '') IS NOT NULL
+      ORDER BY orden ASC, nombre ASC
+    `);
+
+    return res.json({
+      ok: true,
+      redes_sociales: rows,
+    });
+  } catch (error) {
+    console.error('Error al listar redes sociales públicas:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudieron cargar las redes sociales públicas.',
+    });
+  }
+};

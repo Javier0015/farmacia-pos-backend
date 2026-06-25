@@ -35,7 +35,13 @@ const tiposPermitidos = [
 
 export const listarInventarioPorSucursal = async (req, res) => {
   try {
-    const { sucursal, buscar } = req.query;
+    const {
+      sucursal,
+      buscar,
+      id_producto = '',
+      autocomplete = '',
+      limit = '',
+    } = req.query;
 
     if (!sucursal) {
       return res.status(400).json({
@@ -145,13 +151,34 @@ export const listarInventarioPorSucursal = async (req, res) => {
 
     const params = [sucursal];
 
-    if (buscar && buscar.trim()) {
+    const idProducto = Number(id_producto);
+    const tieneIdProducto =
+      String(id_producto ?? '').trim() !== '' &&
+      Number.isInteger(idProducto) &&
+      idProducto > 0;
+
+    if (String(id_producto ?? '').trim() !== '' && !tieneIdProducto) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El parámetro id_producto no es válido',
+      });
+    }
+
+    /*
+     * Una sugerencia seleccionada consulta por ID para evitar ambigüedad
+     * cuando existen productos con nombres similares.
+     */
+    if (tieneIdProducto) {
+      params.push(idProducto);
+      query += ` AND i.id_producto = $${params.length} `;
+    } else if (buscar && buscar.trim()) {
       params.push(`%${buscar.trim()}%`);
 
       query += `
         AND (
           p.nombre ILIKE $${params.length}
           OR p.codigo_barras ILIKE $${params.length}
+          OR p.descripcion ILIKE $${params.length}
           OR p.laboratorio ILIKE $${params.length}
           OR p.presentacion ILIKE $${params.length}
         )
@@ -161,6 +188,23 @@ export const listarInventarioPorSucursal = async (req, res) => {
     query += `
       ORDER BY p.nombre ASC
     `;
+
+    /*
+     * El autocompletado reutiliza esta misma ruta, pero solo necesita una
+     * lista corta de opciones. La consulta normal no se limita.
+     */
+    if (
+      String(autocomplete).trim() === '1' &&
+      !tieneIdProducto
+    ) {
+      const limiteSolicitado = Number(limit);
+      const limite = Number.isInteger(limiteSolicitado)
+        ? Math.min(Math.max(limiteSolicitado, 1), 20)
+        : 8;
+
+      params.push(limite);
+      query += ` LIMIT $${params.length} `;
+    }
 
     const resultado = await pool.query(query, params);
 
@@ -1299,6 +1343,8 @@ export const consultarStockSucursales = async (req, res) => {
       codigo_barras = '',
       codigo = '',
       presentacion = '',
+      id_producto = '',
+      modo = '',
     } = req.query;
 
     const textoBusqueda = String(
@@ -1311,56 +1357,162 @@ export const consultarStockSucursales = async (req, res) => {
       ''
     ).trim();
 
-    if (!textoBusqueda) {
-      return res.status(400).json({
-        ok: false,
-        mensaje:
-          'Debes escribir el nombre, código de barras o presentación del producto',
+    const esBusquedaSugerencias = modo === 'sugerencias';
+
+    /*
+      Mismo endpoint para el autocompletado.
+      Ejemplo:
+      GET /inventario/stock-sucursales?modo=sugerencias&buscar=paracetamol
+
+      Se limita a 10 resultados porque la vista solo necesita sugerencias,
+      no el inventario completo de cada producto.
+    */
+    if (esBusquedaSugerencias) {
+      if (textoBusqueda.length < 2) {
+        return res.json({
+          ok: true,
+          productos: [],
+        });
+      }
+
+      const texto = `%${textoBusqueda}%`;
+
+      const sugerenciasResultado = await pool.query(
+        `
+        SELECT
+          p.id_producto,
+          p.codigo_barras,
+          p.nombre,
+          p.descripcion,
+          p.laboratorio,
+          p.presentacion,
+          c.nombre AS categoria,
+          p.precio_venta
+        FROM productos p
+        LEFT JOIN categorias c
+          ON c.id_categoria = p.id_categoria
+        WHERE p.activo = true
+          AND (
+            p.nombre ILIKE $1
+            OR p.codigo_barras ILIKE $1
+            OR p.descripcion ILIKE $1
+            OR p.laboratorio ILIKE $1
+            OR p.presentacion ILIKE $1
+          )
+        ORDER BY
+          CASE
+            WHEN p.codigo_barras = $2 THEN 0
+            WHEN LOWER(p.nombre) = LOWER($2) THEN 1
+            WHEN p.nombre ILIKE $1 THEN 2
+            WHEN p.descripcion ILIKE $1 THEN 3
+            WHEN p.presentacion ILIKE $1 THEN 4
+            WHEN p.laboratorio ILIKE $1 THEN 5
+            ELSE 6
+          END,
+          p.nombre ASC
+        LIMIT 10
+        `,
+        [texto, textoBusqueda]
+      );
+
+      return res.json({
+        ok: true,
+        productos: sugerenciasResultado.rows,
       });
     }
 
-    const texto = `%${textoBusqueda}%`;
+    let productoResultado;
 
-    const productoResultado = await pool.query(
-      `
-      SELECT
-        p.id_producto,
-        p.codigo_barras,
-        p.nombre,
-        p.descripcion,
-        p.laboratorio,
-        p.presentacion,
-        c.nombre AS categoria,
-        p.precio_venta
-      FROM productos p
-      LEFT JOIN categorias c 
-        ON c.id_categoria = p.id_categoria
-      WHERE 
-        p.activo = true
-        AND (
-          p.nombre ILIKE $1
-          OR p.codigo_barras ILIKE $1
-          OR p.laboratorio ILIKE $1
-          OR p.presentacion ILIKE $1
-        )
-      ORDER BY 
-        CASE 
-          WHEN p.codigo_barras = $2 THEN 1
-          WHEN p.nombre ILIKE $1 THEN 2
-          WHEN p.presentacion ILIKE $1 THEN 3
-          WHEN p.laboratorio ILIKE $1 THEN 4
-          ELSE 5
-        END,
-        p.nombre ASC
-      LIMIT 1
-      `,
-      [texto, textoBusqueda]
-    );
+    /*
+      Cuando el usuario selecciona una sugerencia se consulta por ID.
+      Esto garantiza que la existencia corresponda exactamente al producto
+      elegido, incluso si hay nombres muy parecidos.
+    */
+    if (id_producto !== '') {
+      const idProducto = Number(id_producto);
+
+      if (!Number.isInteger(idProducto) || idProducto <= 0) {
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El id_producto no es válido',
+        });
+      }
+
+      productoResultado = await pool.query(
+        `
+        SELECT
+          p.id_producto,
+          p.codigo_barras,
+          p.nombre,
+          p.descripcion,
+          p.laboratorio,
+          p.presentacion,
+          c.nombre AS categoria,
+          p.precio_venta
+        FROM productos p
+        LEFT JOIN categorias c
+          ON c.id_categoria = p.id_categoria
+        WHERE p.activo = true
+          AND p.id_producto = $1
+        LIMIT 1
+        `,
+        [idProducto]
+      );
+    } else {
+      if (!textoBusqueda) {
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            'Debes escribir el nombre, código de barras o presentación del producto',
+        });
+      }
+
+      const texto = `%${textoBusqueda}%`;
+
+      productoResultado = await pool.query(
+        `
+        SELECT
+          p.id_producto,
+          p.codigo_barras,
+          p.nombre,
+          p.descripcion,
+          p.laboratorio,
+          p.presentacion,
+          c.nombre AS categoria,
+          p.precio_venta
+        FROM productos p
+        LEFT JOIN categorias c
+          ON c.id_categoria = p.id_categoria
+        WHERE p.activo = true
+          AND (
+            p.nombre ILIKE $1
+            OR p.codigo_barras ILIKE $1
+            OR p.descripcion ILIKE $1
+            OR p.laboratorio ILIKE $1
+            OR p.presentacion ILIKE $1
+          )
+        ORDER BY
+          CASE
+            WHEN p.codigo_barras = $2 THEN 0
+            WHEN LOWER(p.nombre) = LOWER($2) THEN 1
+            WHEN p.nombre ILIKE $1 THEN 2
+            WHEN p.descripcion ILIKE $1 THEN 3
+            WHEN p.presentacion ILIKE $1 THEN 4
+            WHEN p.laboratorio ILIKE $1 THEN 5
+            ELSE 6
+          END,
+          p.nombre ASC
+        LIMIT 1
+        `,
+        [texto, textoBusqueda]
+      );
+    }
 
     if (productoResultado.rows.length === 0) {
       return res.status(404).json({
         ok: false,
-        mensaje: 'No se encontró ningún producto con esa búsqueda, puedes agregarlo en el apartado "Medicamento libre"',
+        mensaje:
+          'No se encontró ningún producto con esa búsqueda, puedes agregarlo en el apartado "Medicamento libre"',
       });
     }
 
@@ -1382,11 +1534,11 @@ export const consultarStockSucursales = async (req, res) => {
           ELSE 'DISPONIBLE'
         END AS estado
       FROM sucursales s
-      LEFT JOIN inventario_sucursal i 
+      LEFT JOIN inventario_sucursal i
         ON i.id_sucursal = s.id_sucursal
        AND i.id_producto = $1
       WHERE s.activo = true
-      ORDER BY 
+      ORDER BY
         COALESCE(i.stock_actual, 0) DESC,
         s.nombre ASC
       `,

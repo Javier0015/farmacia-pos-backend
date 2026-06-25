@@ -2,7 +2,33 @@ import { pool } from '../config/db.js';
 
 export const listarProductos = async (req, res) => {
   try {
-    const { buscar, activos } = req.query;
+    const {
+      buscar = '',
+      activos,
+      autocomplete = '',
+      limit = 10,
+      id_producto,
+    } = req.query;
+
+    const textoBusqueda = String(buscar || '').trim();
+    const esAutocomplete =
+      String(autocomplete).toLowerCase() === 'true' ||
+      String(autocomplete) === '1';
+
+    const idProducto =
+      id_producto !== undefined && id_producto !== null && id_producto !== ''
+        ? Number(id_producto)
+        : null;
+
+    if (
+      idProducto !== null &&
+      (!Number.isInteger(idProducto) || idProducto <= 0)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El id_producto no es válido',
+      });
+    }
 
     let query = `
       SELECT
@@ -27,17 +53,48 @@ export const listarProductos = async (req, res) => {
     `;
 
     const params = [];
+    let ordenamiento = 'p.nombre ASC';
 
-    if (buscar) {
-      params.push(`%${buscar.trim()}%`);
+    /*
+     * Cuando se selecciona una sugerencia usamos el identificador, evitando
+     * que un nombre parecido devuelva un producto distinto.
+     */
+    if (idProducto !== null) {
+      params.push(idProducto);
+      query += ` AND p.id_producto = $${params.length} `;
+    } else if (textoBusqueda) {
+      params.push(`%${textoBusqueda}%`);
+      const indiceLike = params.length;
+
+      params.push(textoBusqueda);
+      const indiceExacto = params.length;
 
       query += `
         AND (
-          p.nombre ILIKE $${params.length}
-          OR p.codigo_barras ILIKE $${params.length}
-          OR p.laboratorio ILIKE $${params.length}
-          OR p.presentacion ILIKE $${params.length}
+          p.nombre ILIKE $${indiceLike}
+          OR p.codigo_barras ILIKE $${indiceLike}
+          OR p.descripcion ILIKE $${indiceLike}
+          OR p.laboratorio ILIKE $${indiceLike}
+          OR p.presentacion ILIKE $${indiceLike}
+          OR c.nombre ILIKE $${indiceLike}
         )
+      `;
+
+      /*
+       * Priorizamos coincidencias exactas de código y nombre para que el
+       * autocompletado muestre primero el producto más probable.
+       */
+      ordenamiento = `
+        CASE
+          WHEN p.codigo_barras = $${indiceExacto} THEN 1
+          WHEN LOWER(p.nombre) = LOWER($${indiceExacto}) THEN 2
+          WHEN p.nombre ILIKE $${indiceLike} THEN 3
+          WHEN p.descripcion ILIKE $${indiceLike} THEN 4
+          WHEN p.presentacion ILIKE $${indiceLike} THEN 5
+          WHEN p.laboratorio ILIKE $${indiceLike} THEN 6
+          ELSE 7
+        END,
+        p.nombre ASC
       `;
     }
 
@@ -45,7 +102,18 @@ export const listarProductos = async (req, res) => {
       query += ` AND p.activo = true `;
     }
 
-    query += ` ORDER BY p.nombre ASC `;
+    query += ` ORDER BY ${ordenamiento} `;
+
+    if (esAutocomplete) {
+      const limiteNumerico = Number.parseInt(limit, 10);
+      const limiteSeguro =
+        Number.isInteger(limiteNumerico) && limiteNumerico > 0
+          ? Math.min(limiteNumerico, 20)
+          : 10;
+
+      params.push(limiteSeguro);
+      query += ` LIMIT $${params.length} `;
+    }
 
     const resultado = await pool.query(query, params);
 

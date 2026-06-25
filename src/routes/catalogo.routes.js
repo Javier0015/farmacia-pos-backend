@@ -6,6 +6,8 @@ import {
   actualizarProductoCatalogo,
   cambiarEstadoProductoCatalogo,
   eliminarProductoCatalogo,
+  listarRedesSocialesCatalogo,
+  actualizarRedSocialCatalogo,
 } from '../controllers/catalogo.controller.js';
 
 import uploadCatalogo from '../middlewares/uploadCatalogo.middleware.js';
@@ -15,7 +17,24 @@ const router = Router();
 
 router.get('/', verificarToken, listarCatalogoAdmin);
 
-router.get('/productos-disponibles', verificarToken, listarProductosParaCatalogo);
+router.get(
+  '/productos-disponibles',
+  verificarToken,
+  listarProductosParaCatalogo
+);
+
+/* Redes sociales del catálogo */
+router.get(
+  '/redes-sociales',
+  verificarToken,
+  listarRedesSocialesCatalogo
+);
+
+router.put(
+  '/redes-sociales/:id',
+  verificarToken,
+  actualizarRedSocialCatalogo
+);
 
 router.post(
   '/',
