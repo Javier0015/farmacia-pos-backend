@@ -448,8 +448,32 @@ const normalizarUrlRedSocial = (url) => {
   return urlValidada.toString();
 };
 
+/*
+ * Convierte números mexicanos capturados como 7711234567, 52 771 123 4567
+ * o 5217711234567 al formato internacional que utiliza wa.me: 527711234567.
+ */
+const normalizarTelefonoWhatsApp = (telefono) => {
+  let digitos = String(telefono || '').replace(/\D/g, '');
+
+  if (!digitos) return null;
+
+  if (digitos.startsWith('521') && digitos.length === 13) {
+    digitos = `52${digitos.slice(3)}`;
+  }
+
+  if (digitos.startsWith('52') && digitos.length === 12) {
+    return digitos;
+  }
+
+  if (digitos.length === 10) {
+    return `52${digitos}`;
+  }
+
+  return null;
+};
+
 /* =========================================================
-   ADMINISTRACIÓN: devuelve todas, activas o inactivas
+   ADMINISTRACIÓN: devuelve todas las redes del catálogo
 ========================================================= */
 export const listarRedesSocialesCatalogo = async (req, res) => {
   try {
@@ -482,7 +506,149 @@ export const listarRedesSocialesCatalogo = async (req, res) => {
 };
 
 /* =========================================================
-   ADMINISTRACIÓN: actualiza link, visibilidad y orden
+   ADMINISTRACIÓN: sucursales configurables desde Catálogo
+========================================================= */
+export const listarSucursalesWhatsappCatalogo = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        id_sucursal,
+        nombre,
+        clave,
+        direccion,
+        telefono,
+        activo,
+        mostrar_whatsapp_catalogo
+      FROM public.sucursales
+      ORDER BY activo DESC, nombre ASC
+    `);
+
+    const sucursales = rows.map((sucursal) => {
+      const telefonoWhatsapp = normalizarTelefonoWhatsApp(sucursal.telefono);
+
+      return {
+        ...sucursal,
+        telefono_valido: Boolean(telefonoWhatsapp),
+        telefono_whatsapp: telefonoWhatsapp,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      sucursales: sucursales,
+    });
+  } catch (error) {
+    console.error('Error al listar sucursales para WhatsApp del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudieron cargar las sucursales para WhatsApp.',
+    });
+  }
+};
+
+/* =========================================================
+   ADMINISTRACIÓN: muestra u oculta una sucursal en WhatsApp
+========================================================= */
+export const actualizarSucursalWhatsappCatalogo = async (req, res) => {
+  try {
+    const idSucursal = Number(req.params.id);
+    const mostrarWhatsapp = convertirBooleano(
+      req.body?.mostrar_whatsapp_catalogo,
+      false
+    );
+
+    if (!Number.isInteger(idSucursal) || idSucursal <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la sucursal no es válido.',
+      });
+    }
+
+    const { rows: sucursales } = await pool.query(
+      `
+      SELECT
+        id_sucursal,
+        nombre,
+        telefono,
+        activo
+      FROM public.sucursales
+      WHERE id_sucursal = $1
+      `,
+      [idSucursal]
+    );
+
+    if (sucursales.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'La sucursal no fue encontrada.',
+      });
+    }
+
+    const sucursal = sucursales[0];
+    const telefonoWhatsapp = normalizarTelefonoWhatsApp(sucursal.telefono);
+
+    if (mostrarWhatsapp && !sucursal.activo) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'No puedes mostrar una sucursal inactiva en WhatsApp.',
+      });
+    }
+
+    if (mostrarWhatsapp && !telefonoWhatsapp) {
+      return res.status(400).json({
+        ok: false,
+        mensaje:
+          'La sucursal requiere un teléfono mexicano válido de 10 dígitos para mostrarse en WhatsApp.',
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      UPDATE public.sucursales
+      SET
+        mostrar_whatsapp_catalogo = $1,
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_sucursal = $2
+      RETURNING
+        id_sucursal,
+        nombre,
+        clave,
+        direccion,
+        telefono,
+        activo,
+        mostrar_whatsapp_catalogo,
+        fecha_actualizacion
+      `,
+      [mostrarWhatsapp, idSucursal]
+    );
+
+    const actualizado = rows[0];
+
+    return res.json({
+      ok: true,
+      mensaje: mostrarWhatsapp
+        ? 'Sucursal disponible en WhatsApp del catálogo.'
+        : 'Sucursal oculta de WhatsApp del catálogo.',
+      sucursal: {
+        ...actualizado,
+        telefono_valido: Boolean(
+          normalizarTelefonoWhatsApp(actualizado.telefono)
+        ),
+      },
+    });
+  } catch (error) {
+    console.error('Error al actualizar sucursal para WhatsApp del catálogo:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudo actualizar la sucursal para WhatsApp.',
+    });
+  }
+};
+
+/* =========================================================
+   ADMINISTRACIÓN: actualiza enlace, visibilidad y orden
 ========================================================= */
 export const actualizarRedSocialCatalogo = async (req, res) => {
   try {
@@ -496,35 +662,52 @@ export const actualizarRedSocialCatalogo = async (req, res) => {
       });
     }
 
-    let urlNormalizada = null;
+    const { rows: existentes } = await pool.query(
+      `
+      SELECT id_red_social, clave
+      FROM public.catalogo_redes_sociales
+      WHERE id_red_social = $1
+      `,
+      [idRedSocial]
+    );
 
-    try {
-      urlNormalizada = normalizarUrlRedSocial(url);
-    } catch (errorUrl) {
-      return res.status(400).json({
+    if (existentes.length === 0) {
+      return res.status(404).json({
         ok: false,
-        mensaje: errorUrl.message,
+        mensaje: 'La red social no fue encontrada.',
       });
     }
 
-    const activoNormalizado = convertirBooleano(activo, false);
+    const clave = String(existentes[0].clave || '').toUpperCase();
+    const esWhatsapp = clave === 'WHATSAPP';
 
+    let urlNormalizada = null;
+
+    if (!esWhatsapp) {
+      try {
+        urlNormalizada = normalizarUrlRedSocial(url);
+      } catch (errorUrl) {
+        return res.status(400).json({
+          ok: false,
+          mensaje: errorUrl.message,
+        });
+      }
+    }
+
+    const activoNormalizado = convertirBooleano(activo, false);
     const ordenNormalizado =
       orden === '' || orden === null || orden === undefined
         ? 0
         : Number(orden);
 
-    if (
-      !Number.isInteger(ordenNormalizado) ||
-      ordenNormalizado < 0
-    ) {
+    if (!Number.isInteger(ordenNormalizado) || ordenNormalizado < 0) {
       return res.status(400).json({
         ok: false,
         mensaje: 'El orden debe ser un número entero mayor o igual a cero.',
       });
     }
 
-    if (activoNormalizado && !urlNormalizada) {
+    if (activoNormalizado && !esWhatsapp && !urlNormalizada) {
       return res.status(400).json({
         ok: false,
         mensaje:
@@ -552,19 +735,12 @@ export const actualizarRedSocialCatalogo = async (req, res) => {
         fecha_actualizacion
       `,
       [
-        urlNormalizada,
+        esWhatsapp ? null : urlNormalizada,
         activoNormalizado,
         ordenNormalizado,
         idRedSocial,
       ]
     );
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        mensaje: 'La red social no fue encontrada.',
-      });
-    }
 
     return res.json({
       ok: true,
@@ -582,20 +758,36 @@ export const actualizarRedSocialCatalogo = async (req, res) => {
 };
 
 /* =========================================================
-   PÚBLICO: solo devuelve redes activas con enlace válido
+   PÚBLICO: redes visibles. WhatsApp depende de sucursales
 ========================================================= */
 export const listarRedesSocialesPublicas = async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT
-        clave,
-        nombre,
-        url,
-        orden
-      FROM public.catalogo_redes_sociales
-      WHERE activo = true
-        AND NULLIF(BTRIM(url), '') IS NOT NULL
-      ORDER BY orden ASC, nombre ASC
+        rs.clave,
+        rs.nombre,
+        rs.url,
+        rs.activo,
+        rs.orden
+      FROM public.catalogo_redes_sociales rs
+      WHERE rs.activo = true
+        AND (
+          (
+            rs.clave = 'WHATSAPP'
+            AND EXISTS (
+              SELECT 1
+              FROM public.sucursales s
+              WHERE s.activo = true
+                AND s.mostrar_whatsapp_catalogo = true
+                AND NULLIF(BTRIM(s.telefono), '') IS NOT NULL
+            )
+          )
+          OR (
+            rs.clave <> 'WHATSAPP'
+            AND NULLIF(BTRIM(rs.url), '') IS NOT NULL
+          )
+        )
+      ORDER BY rs.orden ASC, rs.nombre ASC
     `);
 
     return res.json({
@@ -608,6 +800,57 @@ export const listarRedesSocialesPublicas = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: 'No se pudieron cargar las redes sociales públicas.',
+    });
+  }
+};
+
+/* =========================================================
+   PÚBLICO: sucursales visibles en el selector de WhatsApp
+========================================================= */
+export const listarSucursalesWhatsappPublicas = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        id_sucursal,
+        nombre,
+        clave,
+        direccion,
+        telefono
+      FROM public.sucursales
+      WHERE activo = true
+        AND mostrar_whatsapp_catalogo = true
+        AND NULLIF(BTRIM(telefono), '') IS NOT NULL
+      ORDER BY nombre ASC
+    `);
+
+    const sucursales = rows
+      .map((sucursal) => {
+        const telefonoWhatsapp = normalizarTelefonoWhatsApp(sucursal.telefono);
+
+        if (!telefonoWhatsapp) return null;
+
+        const mensaje = encodeURIComponent(
+          `Hola.`
+        );
+
+        return {
+          ...sucursal,
+          telefono_whatsapp: telefonoWhatsapp,
+          url_whatsapp: `https://wa.me/${telefonoWhatsapp}?text=${mensaje}`,
+        };
+      })
+      .filter(Boolean);
+
+    return res.json({
+      ok: true,
+      sucursales: sucursales,
+    });
+  } catch (error) {
+    console.error('Error al listar sucursales públicas para WhatsApp:', error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: 'No se pudieron cargar las sucursales para WhatsApp.',
     });
   }
 };

@@ -7,6 +7,7 @@ import {
 
 import {
   listarRedesSocialesPublicas,
+  listarSucursalesWhatsappPublicas,
 } from '../controllers/catalogo.controller.js';
 
 const router = Router();
@@ -15,8 +16,9 @@ router.get('/', listarCatalogoPublico);
 
 router.get('/categorias', listarCategoriasCatalogoPublico);
 
-/* Debe ir antes de /:id */
+/* Deben ir antes de /:id */
 router.get('/redes-sociales', listarRedesSocialesPublicas);
+router.get('/sucursales-whatsapp', listarSucursalesWhatsappPublicas);
 
 router.get('/:id', obtenerDetalleProductoPublico);
 

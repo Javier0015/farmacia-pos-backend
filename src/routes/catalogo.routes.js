@@ -8,6 +8,8 @@ import {
   eliminarProductoCatalogo,
   listarRedesSocialesCatalogo,
   actualizarRedSocialCatalogo,
+  listarSucursalesWhatsappCatalogo,
+  actualizarSucursalWhatsappCatalogo,
 } from '../controllers/catalogo.controller.js';
 
 import uploadCatalogo from '../middlewares/uploadCatalogo.middleware.js';
@@ -34,6 +36,19 @@ router.put(
   '/redes-sociales/:id',
   verificarToken,
   actualizarRedSocialCatalogo
+);
+
+/* Sucursales que se podrán elegir desde el botón de WhatsApp */
+router.get(
+  '/sucursales-whatsapp',
+  verificarToken,
+  listarSucursalesWhatsappCatalogo
+);
+
+router.put(
+  '/sucursales-whatsapp/:id',
+  verificarToken,
+  actualizarSucursalWhatsappCatalogo
 );
 
 router.post(
