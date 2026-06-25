@@ -517,6 +517,7 @@ export const listarSucursalesWhatsappCatalogo = async (req, res) => {
         clave,
         direccion,
         telefono,
+        url_google_maps,
         activo,
         mostrar_whatsapp_catalogo
       FROM public.sucursales
@@ -571,6 +572,7 @@ export const actualizarSucursalWhatsappCatalogo = async (req, res) => {
         id_sucursal,
         nombre,
         telefono,
+        url_google_maps,
         activo
       FROM public.sucursales
       WHERE id_sucursal = $1
@@ -815,6 +817,7 @@ export const listarSucursalesWhatsappPublicas = async (req, res) => {
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono
       FROM public.sucursales
       WHERE activo = true

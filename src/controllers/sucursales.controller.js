@@ -1,13 +1,60 @@
 import { pool } from '../config/db.js';
 
+const normalizarUrlGoogleMaps = (url) => {
+  const valor = String(url || '').trim();
+
+  if (!valor) return null;
+
+  let urlValidada;
+
+  try {
+    urlValidada = new URL(valor);
+  } catch {
+    throw new Error('El enlace de Google Maps no tiene un formato válido.');
+  }
+
+  if (!['http:', 'https:'].includes(urlValidada.protocol)) {
+    throw new Error(
+      'El enlace de Google Maps debe iniciar con http:// o https://'
+    );
+  }
+
+  const host = urlValidada.hostname.toLowerCase();
+  const ruta = urlValidada.pathname.toLowerCase();
+
+  const esLinkCortoMaps =
+    host === 'maps.app.goo.gl' ||
+    host === 'goo.gl' ||
+    host === 'www.goo.gl';
+
+  const esGoogleMaps =
+    /^maps\.google\.[a-z.]+$/.test(host) ||
+    (/(\.|^)google\.[a-z.]+$/.test(host) && ruta.startsWith('/maps'));
+
+  if (!esLinkCortoMaps && !esGoogleMaps) {
+    throw new Error(
+      'Captura un enlace compartido de Google Maps, por ejemplo https://maps.app.goo.gl/...'
+    );
+  }
+
+  return urlValidada.toString();
+};
+
+const validarCorreo = (correo) => {
+  if (!correo || !correo.trim()) return true;
+
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo);
+};
+
 export const listarSucursales = async (req, res) => {
   try {
     const resultado = await pool.query(`
-      SELECT 
+      SELECT
         id_sucursal,
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono,
         correo,
         responsable,
@@ -38,11 +85,12 @@ export const obtenerSucursal = async (req, res) => {
 
     const resultado = await pool.query(
       `
-      SELECT 
+      SELECT
         id_sucursal,
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono,
         correo,
         responsable,
@@ -78,7 +126,15 @@ export const obtenerSucursal = async (req, res) => {
 
 export const crearSucursal = async (req, res) => {
   try {
-    const { nombre, clave, direccion, telefono, correo, responsable } = req.body;
+    const {
+      nombre,
+      clave,
+      direccion,
+      url_google_maps,
+      telefono,
+      correo,
+      responsable,
+    } = req.body;
 
     if (!nombre || !nombre.trim()) {
       return res.status(400).json({
@@ -94,23 +150,30 @@ export const crearSucursal = async (req, res) => {
       });
     }
 
-    if (correo && correo.trim()) {
-      const correoValido = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo);
+    if (!validarCorreo(correo)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El correo electrónico no es válido',
+      });
+    }
 
-      if (!correoValido) {
-        return res.status(400).json({
-          ok: false,
-          mensaje: 'El correo electrónico no es válido',
-        });
-      }
+    let urlGoogleMapsNormalizada = null;
+
+    try {
+      urlGoogleMapsNormalizada = normalizarUrlGoogleMaps(url_google_maps);
+    } catch (errorUrl) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: errorUrl.message,
+      });
     }
 
     const claveNormalizada = clave.trim().toUpperCase();
 
     const existe = await pool.query(
       `
-      SELECT id_sucursal 
-      FROM sucursales 
+      SELECT id_sucursal
+      FROM sucursales
       WHERE clave = $1
       `,
       [claveNormalizada]
@@ -129,6 +192,7 @@ export const crearSucursal = async (req, res) => {
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono,
         correo,
         responsable,
@@ -136,12 +200,18 @@ export const crearSucursal = async (req, res) => {
         fecha_creacion,
         fecha_actualizacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      RETURNING 
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        true,
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+      )
+      RETURNING
         id_sucursal,
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono,
         correo,
         responsable,
@@ -153,6 +223,7 @@ export const crearSucursal = async (req, res) => {
         nombre.trim(),
         claveNormalizada,
         direccion?.trim() || null,
+        urlGoogleMapsNormalizada,
         telefono?.trim() || null,
         correo?.trim() || null,
         responsable?.trim() || null,
@@ -177,10 +248,12 @@ export const crearSucursal = async (req, res) => {
 export const actualizarSucursal = async (req, res) => {
   try {
     const { id } = req.params;
+
     const {
       nombre,
       clave,
       direccion,
+      url_google_maps,
       telefono,
       correo,
       responsable,
@@ -201,25 +274,32 @@ export const actualizarSucursal = async (req, res) => {
       });
     }
 
-    if (correo && correo.trim()) {
-      const correoValido = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo);
+    if (!validarCorreo(correo)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El correo electrónico no es válido',
+      });
+    }
 
-      if (!correoValido) {
-        return res.status(400).json({
-          ok: false,
-          mensaje: 'El correo electrónico no es válido',
-        });
-      }
+    let urlGoogleMapsNormalizada = null;
+
+    try {
+      urlGoogleMapsNormalizada = normalizarUrlGoogleMaps(url_google_maps);
+    } catch (errorUrl) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: errorUrl.message,
+      });
     }
 
     const claveNormalizada = clave.trim().toUpperCase();
 
     const existe = await pool.query(
       `
-      SELECT id_sucursal 
-      FROM sucursales 
-      WHERE clave = $1 
-      AND id_sucursal <> $2
+      SELECT id_sucursal
+      FROM sucursales
+      WHERE clave = $1
+        AND id_sucursal <> $2
       `,
       [claveNormalizada, id]
     );
@@ -234,21 +314,23 @@ export const actualizarSucursal = async (req, res) => {
     const resultado = await pool.query(
       `
       UPDATE sucursales
-      SET 
+      SET
         nombre = $1,
         clave = $2,
         direccion = $3,
-        telefono = $4,
-        correo = $5,
-        responsable = $6,
-        activo = COALESCE($7, activo),
+        url_google_maps = $4,
+        telefono = $5,
+        correo = $6,
+        responsable = $7,
+        activo = COALESCE($8, activo),
         fecha_actualizacion = CURRENT_TIMESTAMP
-      WHERE id_sucursal = $8
-      RETURNING 
+      WHERE id_sucursal = $9
+      RETURNING
         id_sucursal,
         nombre,
         clave,
         direccion,
+        url_google_maps,
         telefono,
         correo,
         responsable,
@@ -260,6 +342,7 @@ export const actualizarSucursal = async (req, res) => {
         nombre.trim(),
         claveNormalizada,
         direccion?.trim() || null,
+        urlGoogleMapsNormalizada,
         telefono?.trim() || null,
         correo?.trim() || null,
         responsable?.trim() || null,
@@ -299,7 +382,7 @@ export const desactivarSucursal = async (req, res) => {
       SELECT id_sesion
       FROM caja_sesiones
       WHERE id_sucursal = $1
-      AND estado = 'ABIERTA'
+        AND estado = 'ABIERTA'
       LIMIT 1
       `,
       [id]
@@ -315,11 +398,11 @@ export const desactivarSucursal = async (req, res) => {
     const resultado = await pool.query(
       `
       UPDATE sucursales
-      SET 
+      SET
         activo = false,
         fecha_actualizacion = CURRENT_TIMESTAMP
       WHERE id_sucursal = $1
-      RETURNING 
+      RETURNING
         id_sucursal,
         nombre,
         clave,
