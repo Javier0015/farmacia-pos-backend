@@ -14,6 +14,13 @@ const LABEL_TIPO_ATENCION = {
   LABORATORIO: 'Laboratorio',
 };
 
+
+const ESTADOS_NOTA_MEDICA = {
+  NO_APLICA: 'NO_APLICA',
+  PENDIENTE: 'PENDIENTE',
+  COMPLETA: 'COMPLETA',
+};
+
 const normalizarTexto = (valor) => {
   if (valor === undefined || valor === null) return null;
 
@@ -34,6 +41,42 @@ const normalizarTipoAtencion = (tipoAtencion) => {
   return tipo;
 };
 
+
+const esConsultaMedica = (tipoAtencion) => {
+  return normalizarTipoAtencion(tipoAtencion) === 'CONSULTA_MEDICA';
+};
+
+const obtenerEstadoInicialNotaMedica = (tipoAtencion) => {
+  return esConsultaMedica(tipoAtencion)
+    ? ESTADOS_NOTA_MEDICA.PENDIENTE
+    : ESTADOS_NOTA_MEDICA.NO_APLICA;
+};
+
+const obtenerEstadoNotaMedicaAlFinalizar = async (
+  client,
+  idFila,
+  tipoAtencion
+) => {
+  if (!esConsultaMedica(tipoAtencion)) {
+    return ESTADOS_NOTA_MEDICA.NO_APLICA;
+  }
+
+  const notaResult = await client.query(
+    `
+    SELECT 1
+    FROM notas_medicas
+    WHERE id_fila = $1
+      AND activo = true
+    LIMIT 1;
+    `,
+    [idFila]
+  );
+
+  return notaResult.rows.length > 0
+    ? ESTADOS_NOTA_MEDICA.COMPLETA
+    : ESTADOS_NOTA_MEDICA.PENDIENTE;
+};
+
 export const crearPacienteFila = async (req, res) => {
   const client = await pool.connect();
 
@@ -50,6 +93,9 @@ export const crearPacienteFila = async (req, res) => {
     const id_usuario_registro = req.usuario?.id_usuario;
     const idSucursalFinal = id_sucursal || req.usuario?.id_sucursal || null;
     const tipoAtencionFinal = normalizarTipoAtencion(tipo_atencion);
+    const estadoNotaMedicaInicial = obtenerEstadoInicialNotaMedica(
+      tipoAtencionFinal
+    );
 
     if (!id_usuario_registro) {
       return res.status(401).json({
@@ -94,12 +140,13 @@ export const crearPacienteFila = async (req, res) => {
         nombre_paciente,
         telefono,
         tipo_atencion,
+        estado_nota_medica,
         motivo,
         observaciones,
         id_sucursal,
         id_usuario_registro
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *;
     `;
 
@@ -107,6 +154,7 @@ export const crearPacienteFila = async (req, res) => {
       normalizarTexto(nombre_paciente),
       normalizarTexto(telefono),
       tipoAtencionFinal,
+      estadoNotaMedicaInicial,
       normalizarTexto(motivo),
       normalizarTexto(observaciones),
       Number(idSucursalFinal),
@@ -432,35 +480,95 @@ export const vincularExpedienteAFila = async (req, res) => {
 };
 
 export const finalizarPaciente = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { id } = req.params;
+    const idFila = Number(id);
 
-    const query = `
-      UPDATE doctor_fila_espera
-      SET 
-        estatus = 'ATENDIDO',
-        fecha_fin_atencion = NOW(),
-        fecha_actualizacion = NOW()
+    if (!Number.isInteger(idFila) || idFila <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El identificador de la atención no es válido.',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const filaResult = await client.query(
+      `
+      SELECT
+        id_fila,
+        estatus,
+        COALESCE(tipo_atencion, 'CONSULTA_MEDICA') AS tipo_atencion
+      FROM doctor_fila_espera
       WHERE id_fila = $1
-        AND estatus IN ('EN_ESPERA', 'EN_ATENCION')
-      RETURNING *;
-    `;
+      FOR UPDATE;
+      `,
+      [idFila]
+    );
 
-    const { rows } = await pool.query(query, [id]);
+    if (filaResult.rows.length === 0) {
+      await client.query('ROLLBACK');
 
-    if (rows.length === 0) {
       return res.status(404).json({
         ok: false,
         mensaje: 'El paciente no existe o ya fue finalizado.',
       });
     }
 
+    const filaActual = filaResult.rows[0];
+
+    if (!['EN_ESPERA', 'EN_ATENCION'].includes(filaActual.estatus)) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'El paciente no existe o ya fue finalizado.',
+      });
+    }
+
+    const estadoNotaMedica = await obtenerEstadoNotaMedicaAlFinalizar(
+      client,
+      filaActual.id_fila,
+      filaActual.tipo_atencion
+    );
+
+    const actualizacion = await client.query(
+      `
+      UPDATE doctor_fila_espera
+      SET
+        estatus = 'ATENDIDO',
+        estado_nota_medica = $1,
+        fecha_fin_atencion = NOW(),
+        fecha_actualizacion = NOW()
+      WHERE id_fila = $2
+      RETURNING *;
+      `,
+      [estadoNotaMedica, idFila]
+    );
+
+    await client.query('COMMIT');
+
+    const fila = actualizacion.rows[0];
+
     return res.json({
       ok: true,
-      mensaje: 'Atención finalizada correctamente.',
-      fila: rows[0],
+      mensaje:
+        estadoNotaMedica === ESTADOS_NOTA_MEDICA.PENDIENTE
+          ? 'Atención finalizada. La consulta quedó con nota médica pendiente.'
+          : 'Atención finalizada correctamente.',
+      fila,
+      nota_medica_pendiente:
+        estadoNotaMedica === ESTADOS_NOTA_MEDICA.PENDIENTE,
     });
   } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error al hacer ROLLBACK al finalizar atención:', rollbackError);
+    }
+
     console.error('Error al finalizar paciente:', error);
 
     return res.status(500).json({
@@ -468,6 +576,8 @@ export const finalizarPaciente = async (req, res) => {
       mensaje: 'Error al finalizar atención.',
       error: error.message,
     });
+  } finally {
+    client.release();
   }
 };
 
@@ -480,6 +590,7 @@ export const cancelarPaciente = async (req, res) => {
       UPDATE doctor_fila_espera
       SET 
         estatus = 'CANCELADO',
+        estado_nota_medica = 'NO_APLICA',
         observaciones = COALESCE(observaciones, '') || 
           CASE 
             WHEN $2::text IS NOT NULL AND $2::text <> '' 
@@ -525,6 +636,7 @@ export const marcarNoAsistio = async (req, res) => {
       UPDATE doctor_fila_espera
       SET 
         estatus = 'NO_ASISTIO',
+        estado_nota_medica = 'NO_APLICA',
         fecha_actualizacion = NOW()
       WHERE id_fila = $1
         AND estatus IN ('EN_ESPERA', 'EN_ATENCION')

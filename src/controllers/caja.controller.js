@@ -958,34 +958,108 @@ const construirResumenDesdeMovimientos = ({ sesion, movimientos }) => {
   };
 };
 
+
+const esSuperAdminCaja = (usuario) => {
+  return usuario?.rol === 'SUPER_ADMIN';
+};
+
+const usuarioPuedeUsarCaja = async (db, usuario, idCaja) => {
+  if (esSuperAdminCaja(usuario)) {
+    return true;
+  }
+
+  if (!usuario?.id_usuario) {
+    return false;
+  }
+
+  const resultado = await db.query(
+    `
+      SELECT 1
+      FROM cajas
+      WHERE id_caja = $1
+        AND id_usuario_asignado = $2
+        AND activo = true
+      LIMIT 1
+    `,
+    [Number(idCaja), Number(usuario.id_usuario)]
+  );
+
+  return resultado.rows.length > 0;
+};
+
+const usuarioPuedeUsarSesionCaja = async (db, usuario, idSesion) => {
+  if (esSuperAdminCaja(usuario)) {
+    return true;
+  }
+
+  if (!usuario?.id_usuario) {
+    return false;
+  }
+
+  const resultado = await db.query(
+    `
+      SELECT 1
+      FROM caja_sesiones cs
+      INNER JOIN cajas c ON c.id_caja = cs.id_caja
+      WHERE cs.id_sesion = $1
+        AND c.id_usuario_asignado = $2
+      LIMIT 1
+    `,
+    [Number(idSesion), Number(usuario.id_usuario)]
+  );
+
+  return resultado.rows.length > 0;
+};
+
+
 export const listarCajas = async (req, res) => {
   try {
     const { sucursal } = req.query;
+    const idSucursal = Number(sucursal);
 
-    if (!sucursal) {
+    if (!Number.isInteger(idSucursal) || idSucursal <= 0) {
       return res.status(400).json({
         ok: false,
         mensaje: 'El parámetro sucursal es obligatorio',
       });
     }
 
+    const esAdmin = esSuperAdminCaja(req.usuario);
+
+    const params = [idSucursal];
+
+    let condicionUsuario = '';
+
+    if (!esAdmin) {
+      params.push(Number(req.usuario.id_usuario));
+
+      condicionUsuario = `
+        AND c.id_usuario_asignado = $${params.length}
+      `;
+    }
+
     const resultado = await pool.query(
       `
-      SELECT 
-        id_caja,
-        id_sucursal,
-        nombre,
-        activo,
-        fecha_creacion
-      FROM cajas
-      WHERE id_sucursal = $1
-      ORDER BY id_caja ASC
+        SELECT
+          c.id_caja,
+          c.id_sucursal,
+          c.nombre,
+          c.descripcion,
+          c.activo,
+          c.id_usuario_asignado,
+          c.fecha_creacion
+        FROM cajas c
+        WHERE c.id_sucursal = $1
+          AND c.activo = true
+          ${condicionUsuario}
+        ORDER BY c.id_caja ASC
       `,
-      [sucursal]
+      params
     );
 
     return res.json({
       ok: true,
+      es_super_admin: esAdmin,
       cajas: resultado.rows,
     });
   } catch (error) {
@@ -1006,6 +1080,20 @@ export const obtenerSesionAbierta = async (req, res) => {
       return res.status(400).json({
         ok: false,
         mensaje: 'El parámetro id_caja es obligatorio',
+      });
+    }
+
+
+    const tieneAcceso = await usuarioPuedeUsarCaja(
+      pool,
+      req.usuario,
+      id_caja
+    );
+
+    if (!tieneAcceso) {
+      return res.status(403).json({
+        ok: false,
+        mensaje: 'No tienes permiso para consultar esta caja',
       });
     }
 
@@ -1079,7 +1167,24 @@ export const abrirCaja = async (req, res) => {
       });
     }
 
+
+
     await client.query('BEGIN');
+
+    const tieneAcceso = await usuarioPuedeUsarCaja(
+      client,
+      req.usuario,
+      id_caja
+    );
+
+    if (!tieneAcceso) {
+      await client.query('ROLLBACK');
+
+      return res.status(403).json({
+        ok: false,
+        mensaje: 'No tienes permiso para abrir esta caja',
+      });
+    }
 
     const cajaExiste = await client.query(
       `

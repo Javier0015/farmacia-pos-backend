@@ -1,6 +1,122 @@
 import { pool } from '../config/db.js';
 import { enviarTicketDigitalVenta } from '../services/ticketDigitalCorreo.service.js';
 
+const esSuperAdmin = (usuario) => {
+  return String(usuario?.rol || '').trim().toUpperCase() === 'SUPER_ADMIN';
+};
+
+const obtenerIdUsuarioAutenticado = (usuario) => {
+  const idUsuario = Number(usuario?.id_usuario);
+
+  return Number.isInteger(idUsuario) && idUsuario > 0
+    ? idUsuario
+    : null;
+};
+
+/*
+ * Un SUPER_ADMIN puede operar cualquier caja activa.
+ * Cualquier otro usuario solo puede operar la caja activa que tenga asignada
+ * en cajas.id_usuario_asignado.
+ */
+const validarAccesoCajaAsignada = async ({
+  db,
+  usuario,
+  idCaja,
+  idSucursal = null,
+  bloquear = false,
+}) => {
+  const idCajaNumerico = Number(idCaja);
+  const idSucursalNumerico =
+    idSucursal === null || idSucursal === undefined || idSucursal === ''
+      ? null
+      : Number(idSucursal);
+
+  if (!Number.isInteger(idCajaNumerico) || idCajaNumerico <= 0) {
+    return {
+      ok: false,
+      status: 400,
+      mensaje: 'La caja seleccionada no es válida',
+    };
+  }
+
+  if (
+    idSucursalNumerico !== null &&
+    (!Number.isInteger(idSucursalNumerico) || idSucursalNumerico <= 0)
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      mensaje: 'La sucursal seleccionada no es válida',
+    };
+  }
+
+  const esAdmin = esSuperAdmin(usuario);
+  const idUsuario = obtenerIdUsuarioAutenticado(usuario);
+
+  if (!esAdmin && !idUsuario) {
+    return {
+      ok: false,
+      status: 401,
+      mensaje: 'No se pudo identificar al usuario de la sesión',
+    };
+  }
+
+  const params = [idCajaNumerico];
+
+  let query = `
+    SELECT
+      c.id_caja,
+      c.id_sucursal,
+      c.nombre,
+      c.activo,
+      c.id_usuario_asignado
+    FROM cajas c
+    WHERE c.id_caja = $1
+      AND c.activo = true
+  `;
+
+  if (idSucursalNumerico !== null) {
+    params.push(idSucursalNumerico);
+    query += ` AND c.id_sucursal = $${params.length}`;
+  }
+
+  if (!esAdmin) {
+    params.push(idUsuario);
+    query += ` AND c.id_usuario_asignado = $${params.length}`;
+  }
+
+  query += ' LIMIT 1';
+
+  if (bloquear) {
+    query += ' FOR UPDATE';
+  }
+
+  const resultado = await db.query(query, params);
+
+  if (resultado.rows.length === 0) {
+    return {
+      ok: false,
+      status: 403,
+      mensaje: esAdmin
+        ? 'La caja seleccionada no existe, está inactiva o no pertenece a la sucursal indicada'
+        : 'No tienes permiso para operar esta caja. Solo puedes usar la caja asignada a tu usuario.',
+    };
+  }
+
+  return {
+    ok: true,
+    caja: resultado.rows[0],
+  };
+};
+
+const responderAccesoCajaDenegado = (res, acceso) => {
+  return res.status(acceso.status || 403).json({
+    ok: false,
+    mensaje: acceso.mensaje || 'No tienes permiso para operar esta caja',
+  });
+};
+
+
 const generarFolioVenta = () => {
   const fecha = new Date();
 
@@ -876,6 +992,19 @@ export const crearVenta = async (req, res) => {
     const esPagoConPuntos = metodoPagoFinal === 'PUNTOS';
 
     await client.query('BEGIN');
+
+    const accesoCaja = await validarAccesoCajaAsignada({
+      db: client,
+      usuario: req.usuario,
+      idCaja: id_caja,
+      idSucursal: id_sucursal,
+      bloquear: true,
+    });
+
+    if (!accesoCaja.ok) {
+      await client.query('ROLLBACK');
+      return responderAccesoCajaDenegado(res, accesoCaja);
+    }
 
     const sesion = await client.query(
       `
@@ -2360,6 +2489,17 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
 
     const venta = ventaResultado.rows[0];
 
+    const accesoCaja = await validarAccesoCajaAsignada({
+      db: pool,
+      usuario: req.usuario,
+      idCaja: venta.id_caja,
+      idSucursal: venta.id_sucursal,
+    });
+
+    if (!accesoCaja.ok) {
+      return responderAccesoCajaDenegado(res, accesoCaja);
+    }
+
     const detalleResultado = await pool.query(
       `
       SELECT
@@ -2479,6 +2619,20 @@ export const listarVentas = async (req, res) => {
 
     const params = [];
 
+    if (!esSuperAdmin(req.usuario)) {
+      const idUsuario = obtenerIdUsuarioAutenticado(req.usuario);
+
+      if (!idUsuario) {
+        return res.status(401).json({
+          ok: false,
+          mensaje: 'No se pudo identificar al usuario de la sesión',
+        });
+      }
+
+      params.push(idUsuario);
+      query += ` AND c.id_usuario_asignado = $${params.length} `;
+    }
+
     if (sucursal) {
       params.push(sucursal);
       query += ` AND v.id_sucursal = $${params.length} `;
@@ -2581,6 +2735,19 @@ export const obtenerVenta = async (req, res) => {
         ok: false,
         mensaje: 'Venta no encontrada',
       });
+    }
+
+    const venta = ventaResultado.rows[0];
+
+    const accesoCaja = await validarAccesoCajaAsignada({
+      db: pool,
+      usuario: req.usuario,
+      idCaja: venta.id_caja,
+      idSucursal: venta.id_sucursal,
+    });
+
+    if (!accesoCaja.ok) {
+      return responderAccesoCajaDenegado(res, accesoCaja);
     }
 
     const detalleResultado = await pool.query(
@@ -2766,6 +2933,20 @@ export const devolverVenta = async (req, res) => {
     }
 
     const venta = ventaResultado.rows[0];
+
+    const accesoCaja = await validarAccesoCajaAsignada({
+      db: client,
+      usuario: req.usuario,
+      idCaja: venta.id_caja,
+      idSucursal: venta.id_sucursal,
+      bloquear: true,
+    });
+
+    if (!accesoCaja.ok) {
+      await client.query('ROLLBACK');
+      return responderAccesoCajaDenegado(res, accesoCaja);
+    }
+
     const estadoVenta = String(venta.estado || '').toUpperCase();
 
     if (!estadosVentaConDevolucionPermitida.includes(estadoVenta)) {
@@ -3327,6 +3508,20 @@ export const listarVentasServiciosClinicos = async (req, res) => {
     let where = `
       WHERE 1 = 1
     `;
+
+    if (!esSuperAdmin(req.usuario)) {
+      const idUsuario = obtenerIdUsuarioAutenticado(req.usuario);
+
+      if (!idUsuario) {
+        return res.status(401).json({
+          ok: false,
+          mensaje: 'No se pudo identificar al usuario de la sesión',
+        });
+      }
+
+      params.push(idUsuario);
+      where += ` AND c.id_usuario_asignado = $${params.length} `;
+    }
 
     if (estado && String(estado).toUpperCase() !== 'TODOS') {
       params.push(String(estado).toUpperCase());

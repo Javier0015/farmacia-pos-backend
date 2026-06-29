@@ -76,6 +76,48 @@ const obtenerTituloTipoNota = (tipoNota) => {
     : 'Nota médica inicial';
 };
 
+
+const esConsultaMedica = (tipoAtencion) => {
+  return String(tipoAtencion || 'CONSULTA_MEDICA')
+    .trim()
+    .toUpperCase() === 'CONSULTA_MEDICA';
+};
+
+const sincronizarEstadoNotaMedicaFila = async (client, idFila) => {
+  const idFilaFinal = normalizarIdEntero(idFila);
+
+  if (!idFilaFinal) {
+    return null;
+  }
+
+  const resultado = await client.query(
+    `
+    UPDATE doctor_fila_espera f
+    SET
+      estado_nota_medica = CASE
+        WHEN COALESCE(f.tipo_atencion, 'CONSULTA_MEDICA') <> 'CONSULTA_MEDICA'
+          THEN 'NO_APLICA'
+        WHEN f.estatus IN ('CANCELADO', 'NO_ASISTIO')
+          THEN 'NO_APLICA'
+        WHEN EXISTS (
+          SELECT 1
+          FROM notas_medicas nm
+          WHERE nm.id_fila = f.id_fila
+            AND nm.activo = true
+        )
+          THEN 'COMPLETA'
+        ELSE 'PENDIENTE'
+      END,
+      fecha_actualizacion = NOW()
+    WHERE f.id_fila = $1
+    RETURNING id_fila, estado_nota_medica;
+    `,
+    [idFilaFinal]
+  );
+
+  return resultado.rows[0] || null;
+};
+
 const registrarDocumentoClinico = async (
   client,
   {
@@ -262,7 +304,8 @@ export const crearNotaMedica = async (req, res) => {
           id_fila,
           id_expediente,
           id_sucursal,
-          estatus
+          estatus,
+          COALESCE(tipo_atencion, 'CONSULTA_MEDICA') AS tipo_atencion
         FROM doctor_fila_espera
         WHERE id_fila = $1
         LIMIT 1;
@@ -296,13 +339,17 @@ export const crearNotaMedica = async (req, res) => {
 
       idSucursalFinal = normalizarIdEntero(fila.id_sucursal) || idSucursalFinal;
 
-      if (fila.estatus !== 'EN_ATENCION') {
+      const puedeRegistrarNota =
+        fila.estatus === 'EN_ATENCION' ||
+        (fila.estatus === 'ATENDIDO' && esConsultaMedica(fila.tipo_atencion));
+
+      if (!puedeRegistrarNota) {
         await client.query('ROLLBACK');
 
         return res.status(400).json({
           ok: false,
           mensaje:
-            'La nota médica solo puede registrarse cuando la atención está en estado EN_ATENCION.',
+            'La nota médica solo puede registrarse durante la atención o después de finalizar una consulta médica con nota pendiente.',
         });
       }
 
@@ -430,6 +477,11 @@ export const crearNotaMedica = async (req, res) => {
       },
     });
 
+    const filaActualizada = await sincronizarEstadoNotaMedicaFila(
+      client,
+      idFilaFinal
+    );
+
     await client.query('COMMIT');
 
     return res.status(201).json({
@@ -438,6 +490,7 @@ export const crearNotaMedica = async (req, res) => {
       nota,
       expediente: expedienteResult.rows[0],
       documento_clinico: documentoClinico,
+      fila: filaActualizada,
     });
   } catch (error) {
     try {
@@ -788,6 +841,8 @@ export const actualizarNotaMedica = async (req, res) => {
 };
 
 export const eliminarNotaMedica = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { idNota } = req.params;
     const idNotaFinal = normalizarIdEntero(idNota);
@@ -799,10 +854,12 @@ export const eliminarNotaMedica = async (req, res) => {
       });
     }
 
-    const { rows } = await pool.query(
+    await client.query('BEGIN');
+
+    const resultado = await client.query(
       `
       UPDATE notas_medicas
-      SET 
+      SET
         activo = false,
         fecha_actualizacion = NOW()
       WHERE id_nota = $1
@@ -812,19 +869,37 @@ export const eliminarNotaMedica = async (req, res) => {
       [idNotaFinal]
     );
 
-    if (rows.length === 0) {
+    if (resultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(404).json({
         ok: false,
         mensaje: 'La nota médica no existe o ya estaba inactiva.',
       });
     }
 
+    const nota = resultado.rows[0];
+
+    const filaActualizada = await sincronizarEstadoNotaMedicaFila(
+      client,
+      nota.id_fila
+    );
+
+    await client.query('COMMIT');
+
     return res.json({
       ok: true,
       mensaje: 'Nota médica eliminada correctamente.',
-      nota: rows[0],
+      nota,
+      fila: filaActualizada,
     });
   } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error al hacer ROLLBACK al eliminar nota médica:', rollbackError);
+    }
+
     console.error('Error al eliminar nota médica:', error);
 
     return res.status(500).json({
@@ -832,5 +907,7 @@ export const eliminarNotaMedica = async (req, res) => {
       mensaje: 'Error al eliminar la nota médica.',
       error: error.message,
     });
+  } finally {
+    client.release();
   }
 };

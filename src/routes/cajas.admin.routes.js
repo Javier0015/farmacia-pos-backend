@@ -1,9 +1,11 @@
 import { Router } from 'express';
+
 import {
   listarCajasAdmin,
   crearCajaAdmin,
   actualizarCajaAdmin,
   desactivarCajaAdmin,
+  listarCajerosDisponiblesAdmin,
 } from '../controllers/cajas.admin.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
@@ -21,9 +23,19 @@ const soloSuperAdmin = (req, res, next) => {
   next();
 };
 
+router.get(
+  '/cajeros',
+  verificarToken,
+  soloSuperAdmin,
+  listarCajerosDisponiblesAdmin
+);
+
 router.get('/', verificarToken, soloSuperAdmin, listarCajasAdmin);
+
 router.post('/', verificarToken, soloSuperAdmin, crearCajaAdmin);
+
 router.put('/:id', verificarToken, soloSuperAdmin, actualizarCajaAdmin);
+
 router.delete('/:id', verificarToken, soloSuperAdmin, desactivarCajaAdmin);
 
 export default router;

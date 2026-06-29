@@ -8,6 +8,79 @@ const obtenerLimiteAutocomplete = (valor, limitePorDefecto = 8) => {
   return Math.min(Math.max(limite, 1), 10);
 };
 
+/*
+ * Stock público:
+ * Solo considera inventario de sucursales activas.
+ */
+const JOIN_STOCK_PUBLICO = `
+  LEFT JOIN (
+    SELECT
+      i.id_producto,
+      COALESCE(
+        SUM(GREATEST(COALESCE(i.stock_actual, 0), 0)),
+        0
+      ) AS stock_total
+    FROM public.inventario_sucursal i
+    INNER JOIN public.sucursales s
+      ON s.id_sucursal = i.id_sucursal
+    WHERE s.activo = true
+    GROUP BY i.id_producto
+  ) inv
+    ON inv.id_producto = p.id_producto
+`;
+
+/*
+ * Sucursales donde el producto tiene existencia real.
+ * No exponemos cantidades de stock al público; solo disponibilidad.
+ */
+const JOIN_SUCURSALES_DISPONIBLES = `
+  LEFT JOIN (
+    SELECT
+      disponibilidad.id_producto,
+
+      COUNT(*)::int AS total_sucursales_disponibles,
+
+      jsonb_agg(
+        jsonb_build_object(
+          'id_sucursal', disponibilidad.id_sucursal,
+          'nombre', disponibilidad.nombre,
+          'clave', disponibilidad.clave,
+          'direccion', disponibilidad.direccion,
+          'telefono', disponibilidad.telefono,
+          'url_google_maps', disponibilidad.url_google_maps
+        )
+        ORDER BY disponibilidad.nombre ASC
+      ) AS sucursales_disponibles
+
+    FROM (
+      SELECT
+        i.id_producto,
+        s.id_sucursal,
+        s.nombre,
+        s.clave,
+        s.direccion,
+        s.telefono,
+        s.url_google_maps
+      FROM public.inventario_sucursal i
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = i.id_sucursal
+      WHERE i.stock_actual > 0
+        AND s.activo = true
+      GROUP BY
+        i.id_producto,
+        s.id_sucursal,
+        s.nombre,
+        s.clave,
+        s.direccion,
+        s.telefono,
+        s.url_google_maps
+    ) disponibilidad
+
+    GROUP BY disponibilidad.id_producto
+  ) sucursales_disponibles
+    ON sucursales_disponibles.id_producto = p.id_producto
+`;
+
 export const listarCatalogoPublico = async (req, res) => {
   try {
     const {
@@ -18,10 +91,6 @@ export const listarCatalogoPublico = async (req, res) => {
       limit,
     } = req.query;
 
-    /*
-     * Modo ligero para el autocompletado del buscador público. Solo devuelve
-     * los campos que el menú necesita y limita el resultado a 10 opciones.
-     */
     if (autocomplete === '1' || autocomplete === 'true') {
       const texto = String(q || '').trim();
 
@@ -53,26 +122,35 @@ export const listarCatalogoPublico = async (req, res) => {
           cp.id_producto,
           cp.titulo_catalogo,
           cp.imagen_url,
+
           p.codigo_barras,
           p.nombre AS nombre_producto,
           p.laboratorio,
           p.presentacion,
           p.precio_venta,
+
           c.nombre AS nombre_categoria,
+
           oc.porcentaje_descuento,
+
           CASE
             WHEN oc.id_oferta IS NOT NULL THEN
               ROUND(
-                p.precio_venta - (p.precio_venta * oc.porcentaje_descuento / 100),
+                p.precio_venta -
+                (p.precio_venta * oc.porcentaje_descuento / 100),
                 2
               )
             ELSE p.precio_venta
           END AS precio_final
+
         FROM public.catalogo_productos cp
+
         INNER JOIN public.productos p
           ON p.id_producto = cp.id_producto
+
         LEFT JOIN public.categorias c
           ON c.id_categoria = p.id_categoria
+
         LEFT JOIN LATERAL (
           SELECT
             oc2.id_oferta,
@@ -84,6 +162,7 @@ export const listarCatalogoPublico = async (req, res) => {
           ORDER BY oc2.fecha_creacion DESC
           LIMIT 1
         ) oc ON true
+
         WHERE cp.activo = true
           AND p.activo = true
           AND (
@@ -95,6 +174,7 @@ export const listarCatalogoPublico = async (req, res) => {
             OR cp.titulo_catalogo ILIKE $2
           )
           ${filtroCategoria}
+
         ORDER BY
           CASE
             WHEN p.codigo_barras ILIKE $1 THEN 0
@@ -105,6 +185,7 @@ export const listarCatalogoPublico = async (req, res) => {
           cp.destacado DESC,
           cp.orden ASC,
           p.nombre ASC
+
         LIMIT $${indiceLimite};
       `;
 
@@ -135,6 +216,7 @@ export const listarCatalogoPublico = async (req, res) => {
 
     if (q) {
       params.push(`%${String(q).trim()}%`);
+
       whereExtra += `
         AND (
           p.nombre ILIKE $${params.length}
@@ -176,6 +258,16 @@ export const listarCatalogoPublico = async (req, res) => {
 
         COALESCE(inv.stock_total, 0) AS stock_total,
 
+        COALESCE(
+          sucursales_disponibles.total_sucursales_disponibles,
+          0
+        ) AS total_sucursales_disponibles,
+
+        COALESCE(
+          sucursales_disponibles.sucursales_disponibles,
+          '[]'::jsonb
+        ) AS sucursales_disponibles,
+
         oc.id_oferta,
         oc.nombre AS nombre_oferta,
         oc.descripcion AS descripcion_oferta,
@@ -189,7 +281,8 @@ export const listarCatalogoPublico = async (req, res) => {
         CASE
           WHEN oc.id_oferta IS NOT NULL THEN
             ROUND(
-              p.precio_venta - (p.precio_venta * oc.porcentaje_descuento / 100),
+              p.precio_venta -
+              (p.precio_venta * oc.porcentaje_descuento / 100),
               2
             )
           ELSE p.precio_venta
@@ -217,14 +310,9 @@ export const listarCatalogoPublico = async (req, res) => {
         LIMIT 1
       ) oc ON true
 
-      LEFT JOIN (
-        SELECT
-          id_producto,
-          SUM(stock_actual) AS stock_total
-        FROM public.inventario_sucursal
-        GROUP BY id_producto
-      ) inv
-        ON inv.id_producto = p.id_producto
+      ${JOIN_STOCK_PUBLICO}
+
+      ${JOIN_SUCURSALES_DISPONIBLES}
 
       WHERE cp.activo = true
         AND p.activo = true
@@ -283,6 +371,16 @@ export const obtenerDetalleProductoPublico = async (req, res) => {
 
         COALESCE(inv.stock_total, 0) AS stock_total,
 
+        COALESCE(
+          sucursales_disponibles.total_sucursales_disponibles,
+          0
+        ) AS total_sucursales_disponibles,
+
+        COALESCE(
+          sucursales_disponibles.sucursales_disponibles,
+          '[]'::jsonb
+        ) AS sucursales_disponibles,
+
         oc.id_oferta,
         oc.nombre AS nombre_oferta,
         oc.descripcion AS descripcion_oferta,
@@ -296,7 +394,8 @@ export const obtenerDetalleProductoPublico = async (req, res) => {
         CASE
           WHEN oc.id_oferta IS NOT NULL THEN
             ROUND(
-              p.precio_venta - (p.precio_venta * oc.porcentaje_descuento / 100),
+              p.precio_venta -
+              (p.precio_venta * oc.porcentaje_descuento / 100),
               2
             )
           ELSE p.precio_venta
@@ -324,14 +423,9 @@ export const obtenerDetalleProductoPublico = async (req, res) => {
         LIMIT 1
       ) oc ON true
 
-      LEFT JOIN (
-        SELECT
-          id_producto,
-          SUM(stock_actual) AS stock_total
-        FROM public.inventario_sucursal
-        GROUP BY id_producto
-      ) inv
-        ON inv.id_producto = p.id_producto
+      ${JOIN_STOCK_PUBLICO}
+
+      ${JOIN_SUCURSALES_DISPONIBLES}
 
       WHERE cp.id_catalogo = $1
         AND cp.activo = true
