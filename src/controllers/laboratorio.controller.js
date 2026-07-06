@@ -370,8 +370,8 @@ export const crearSolicitudLaboratorio = async (req, res) => {
 
     const edad =
       paciente.edad !== undefined &&
-      paciente.edad !== null &&
-      paciente.edad !== ''
+        paciente.edad !== null &&
+        paciente.edad !== ''
         ? Number(paciente.edad)
         : null;
 
@@ -675,10 +675,12 @@ export const obtenerSolicitudLaboratorio = async (req, res) => {
         s.*,
         p.nombre_completo AS medico_nombre,
         p.cedula_profesional AS medico_cedula,
-        p.especialidad AS medico_especialidad
+        p.especialidad AS medico_especialidad,
+        p.telefono AS medico_telefono
       FROM laboratorio_solicitudes s
       LEFT JOIN doctores_shaddai_perfiles p
         ON p.id_perfil = s.id_doctor
+       AND p.activo = TRUE
       WHERE s.id_solicitud = $1
         AND s.id_usuario_creador = $2
         AND s.activo = TRUE
