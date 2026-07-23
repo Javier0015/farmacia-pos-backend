@@ -1214,8 +1214,8 @@ export const crearVenta = async (req, res) => {
         });
       }
 
-const productoResultado = await client.query(
-  `
+      const productoResultado = await client.query(
+        `
   SELECT 
     id_producto,
     id_categoria,
@@ -1230,8 +1230,8 @@ const productoResultado = await client.query(
   WHERE id_producto = $1
     AND activo = true
   `,
-  [id_producto]
-);
+        [id_producto]
+      );
 
       if (productoResultado.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -2352,42 +2352,42 @@ const productoResultado = await client.query(
      */
     const tarjetaParaTicketDigital = tarjetaPuntos
       ? {
-          ...tarjetaPuntos,
-          ...(tarjetaActualizada || {}),
-        }
+        ...tarjetaPuntos,
+        ...(tarjetaActualizada || {}),
+      }
       : null;
 
     const ticketDigital = esValorActivo(enviar_ticket_digital)
       ? await enviarTicketDigitalVenta({
-          idSucursal: Number(id_sucursal),
-          tarjeta: tarjetaParaTicketDigital,
-          venta,
-          productos: productosProcesados,
-          servicios: serviciosProcesados,
-          pagos: pagosVenta,
-          resumen: {
-            subtotal: subtotalVenta,
-            subtotal_sin_descuento: subtotalSinDescuentoVenta,
-            descuento_ofertas: descuentoOfertasVenta,
-            descuento: descuentoVenta,
-            impuesto: impuestoVenta,
-            total: totalVenta,
-            metodo_pago: metodoPagoFinal,
-            monto_recibido: montoRecibidoFinal,
-            cambio,
-            monto_pagado_dinero: montoPagadoDinero,
-            monto_pagado_puntos: montoPagadoPuntos,
-            puntos_usados: puntosUsados,
-            puntos_ganados: puntosClienteGanados,
-            puntos_ganados_cliente: puntosClienteGanados,
-          },
-        })
+        idSucursal: Number(id_sucursal),
+        tarjeta: tarjetaParaTicketDigital,
+        venta,
+        productos: productosProcesados,
+        servicios: serviciosProcesados,
+        pagos: pagosVenta,
+        resumen: {
+          subtotal: subtotalVenta,
+          subtotal_sin_descuento: subtotalSinDescuentoVenta,
+          descuento_ofertas: descuentoOfertasVenta,
+          descuento: descuentoVenta,
+          impuesto: impuestoVenta,
+          total: totalVenta,
+          metodo_pago: metodoPagoFinal,
+          monto_recibido: montoRecibidoFinal,
+          cambio,
+          monto_pagado_dinero: montoPagadoDinero,
+          monto_pagado_puntos: montoPagadoPuntos,
+          puntos_usados: puntosUsados,
+          puntos_ganados: puntosClienteGanados,
+          puntos_ganados_cliente: puntosClienteGanados,
+        },
+      })
       : {
-          solicitado: false,
-          enviado: false,
-          estatus: 'NO_SOLICITADO',
-          mensaje: 'No se solicitó el envío de ticket digital para esta venta.',
-        };
+        solicitado: false,
+        enviado: false,
+        estatus: 'NO_SOLICITADO',
+        mensaje: 'No se solicitó el envío de ticket digital para esta venta.',
+      };
 
     return res.status(201).json({
       ok: true,
@@ -2645,12 +2645,20 @@ export const listarVentas = async (req, res) => {
 
     if (fecha_inicio) {
       params.push(fecha_inicio);
-      query += ` AND v.fecha_venta >= $${params.length} `;
+      where += `
+    AND (
+      v.fecha_venta AT TIME ZONE 'America/Mexico_City'
+    )::date >= $${params.length}::date
+  `;
     }
 
     if (fecha_fin) {
       params.push(fecha_fin);
-      query += ` AND v.fecha_venta <= $${params.length} `;
+      where += `
+    AND (
+      v.fecha_venta AT TIME ZONE 'America/Mexico_City'
+    )::date <= $${params.length}::date
+  `;
     }
 
     query += ` ORDER BY v.fecha_venta DESC `;
