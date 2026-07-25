@@ -289,17 +289,35 @@ const obtenerDatosControlSanitarioShaddai = async ({
 
     const selectDoctorSql = selects.join(',\n        ');
 
-    const doctorResultado = await client.query(
+    /*
+     * recetas_shaddai.id_doctor normalmente guarda el id_perfil.
+     * Primero lo buscamos como perfil y solamente, si no existe, como usuario.
+     * Nunca usamos OR porque un mismo número puede pertenecer al perfil de un
+     * doctor y al usuario de otro doctor distinto.
+     */
+    let doctorResultado = await client.query(
       `
       SELECT
         ${selectDoctorSql}
       FROM doctores_shaddai_perfiles
       WHERE id_perfil = $1
-         OR id_usuario = $1
       LIMIT 1
       `,
       [receta.id_doctor]
     );
+
+    if (doctorResultado.rows.length === 0) {
+      doctorResultado = await client.query(
+        `
+        SELECT
+          ${selectDoctorSql}
+        FROM doctores_shaddai_perfiles
+        WHERE id_usuario = $1
+        LIMIT 1
+        `,
+        [receta.id_doctor]
+      );
+    }
 
     if (doctorResultado.rows.length > 0) {
       medicoNombre =
@@ -1092,8 +1110,11 @@ export const crearVenta = async (req, res) => {
     }
 
     let doctorShaddaiVenta = null;
+    let idDoctorVenta = null;
 
-    const productoConRecetaShaddai = productosVenta.find((item) => item.id_receta_shaddai);
+    const productoConRecetaShaddai = productosVenta.find(
+      (item) => item.id_receta_shaddai
+    );
 
     const idRecetaShaddaiVenta = id_receta_shaddai
       ? Number(id_receta_shaddai)
@@ -1101,53 +1122,118 @@ export const crearVenta = async (req, res) => {
         ? Number(productoConRecetaShaddai.id_receta_shaddai)
         : null;
 
-    const servicioClinicoVenta = serviciosVenta.find((item) => item.id_solicitud_servicio);
-    const idSolicitudServicioVenta = servicioClinicoVenta?.id_solicitud_servicio
-      ? Number(servicioClinicoVenta.id_solicitud_servicio)
-      : null;
+    const servicioClinicoVenta = serviciosVenta.find(
+      (item) => item.id_solicitud_servicio
+    );
 
-    let idDoctorVenta = id_doctor ? Number(id_doctor) : null;
+    const idSolicitudServicioVenta =
+      servicioClinicoVenta?.id_solicitud_servicio
+        ? Number(servicioClinicoVenta.id_solicitud_servicio)
+        : null;
 
-    if (!idDoctorVenta && idRecetaShaddaiVenta) {
+    /*
+     * En servicios_clinicos_solicitudes, id_doctor corresponde al id_usuario
+     * del doctor. La solicitud es la fuente oficial y tiene prioridad sobre
+     * cualquier id_doctor enviado por el frontend.
+     */
+    if (idSolicitudServicioVenta) {
+      const servicioDoctorResultado = await client.query(
+        `
+        SELECT
+          s.id_doctor,
+          d.id_perfil,
+          d.id_usuario,
+          d.nombre_completo,
+          d.porcentaje_puntos_venta,
+          d.puntos_activo,
+          d.activo
+        FROM servicios_clinicos_solicitudes s
+        LEFT JOIN doctores_shaddai_perfiles d
+          ON d.id_usuario = s.id_doctor
+        WHERE s.id_solicitud_servicio = $1
+          AND s.activo = true
+        LIMIT 1
+        `,
+        [idSolicitudServicioVenta]
+      );
+
+      if (servicioDoctorResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'No se encontró la solicitud del servicio clínico.',
+        });
+      }
+
+      const doctorServicio = servicioDoctorResultado.rows[0];
+
+      if (!doctorServicio.id_doctor) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'La solicitud del servicio clínico no tiene doctor asignado.',
+        });
+      }
+
+      if (!doctorServicio.id_perfil) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje:
+            'No se encontró el perfil Shaddai asociado al usuario doctor de la solicitud.',
+        });
+      }
+
+      if (!esValorActivo(doctorServicio.activo)) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El doctor asociado al servicio clínico está inactivo.',
+        });
+      }
+
+      doctorShaddaiVenta = doctorServicio;
+      idDoctorVenta = Number(doctorServicio.id_perfil);
+    }
+
+    /*
+     * Para recetas Shaddai, primero interpretamos recetas_shaddai.id_doctor
+     * como id_perfil. Solo si no existe ese perfil intentamos id_usuario.
+     */
+    else if (idRecetaShaddaiVenta) {
       const recetaDoctorResultado = await client.query(
         `
         SELECT
           id_doctor
         FROM recetas_shaddai
         WHERE id_receta = $1
+          AND activo = true
         LIMIT 1
         `,
         [idRecetaShaddaiVenta]
       );
 
-      if (recetaDoctorResultado.rows.length > 0) {
-        idDoctorVenta = recetaDoctorResultado.rows[0].id_doctor
-          ? Number(recetaDoctorResultado.rows[0].id_doctor)
-          : null;
-      }
-    }
+      if (
+        recetaDoctorResultado.rows.length === 0 ||
+        !recetaDoctorResultado.rows[0].id_doctor
+      ) {
+        await client.query('ROLLBACK');
 
-    if (!idDoctorVenta && idSolicitudServicioVenta) {
-      const servicioDoctorResultado = await client.query(
-        `
-        SELECT
-          id_doctor
-        FROM servicios_clinicos_solicitudes
-        WHERE id_solicitud_servicio = $1
-        LIMIT 1
-        `,
-        [idSolicitudServicioVenta]
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'La receta Shaddai no tiene un doctor válido asociado.',
+        });
+      }
+
+      const idDoctorReceta = Number(
+        recetaDoctorResultado.rows[0].id_doctor
       );
 
-      if (servicioDoctorResultado.rows.length > 0) {
-        idDoctorVenta = servicioDoctorResultado.rows[0].id_doctor
-          ? Number(servicioDoctorResultado.rows[0].id_doctor)
-          : null;
-      }
-    }
-
-    if (idDoctorVenta) {
-      const doctorResultado = await client.query(
+      let doctorResultado = await client.query(
         `
         SELECT
           id_perfil,
@@ -1158,11 +1244,91 @@ export const crearVenta = async (req, res) => {
           activo
         FROM doctores_shaddai_perfiles
         WHERE id_perfil = $1
-           OR id_usuario = $1
         LIMIT 1
         `,
-        [idDoctorVenta]
+        [idDoctorReceta]
       );
+
+      if (doctorResultado.rows.length === 0) {
+        doctorResultado = await client.query(
+          `
+          SELECT
+            id_perfil,
+            id_usuario,
+            nombre_completo,
+            porcentaje_puntos_venta,
+            puntos_activo,
+            activo
+          FROM doctores_shaddai_perfiles
+          WHERE id_usuario = $1
+          LIMIT 1
+          `,
+          [idDoctorReceta]
+        );
+      }
+
+      if (doctorResultado.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          ok: false,
+          mensaje: 'No se encontró el doctor Shaddai asociado a la receta.',
+        });
+      }
+
+      doctorShaddaiVenta = doctorResultado.rows[0];
+      idDoctorVenta = Number(doctorShaddaiVenta.id_perfil);
+
+      if (!esValorActivo(doctorShaddaiVenta.activo)) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          ok: false,
+          mensaje: 'El doctor Shaddai asociado a la venta está inactivo.',
+        });
+      }
+    }
+
+    /*
+     * Cuando no hay servicio ni receta, id_doctor se considera id_perfil.
+     * Si el perfil no existe, se intenta como id_usuario solo como respaldo.
+     */
+    else if (id_doctor) {
+      const idDoctorEnviado = Number(id_doctor);
+
+      let doctorResultado = await client.query(
+        `
+        SELECT
+          id_perfil,
+          id_usuario,
+          nombre_completo,
+          porcentaje_puntos_venta,
+          puntos_activo,
+          activo
+        FROM doctores_shaddai_perfiles
+        WHERE id_perfil = $1
+        LIMIT 1
+        `,
+        [idDoctorEnviado]
+      );
+
+      if (doctorResultado.rows.length === 0) {
+        doctorResultado = await client.query(
+          `
+          SELECT
+            id_perfil,
+            id_usuario,
+            nombre_completo,
+            porcentaje_puntos_venta,
+            puntos_activo,
+            activo
+          FROM doctores_shaddai_perfiles
+          WHERE id_usuario = $1
+          LIMIT 1
+          `,
+          [idDoctorEnviado]
+        );
+      }
 
       if (doctorResultado.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -1174,7 +1340,6 @@ export const crearVenta = async (req, res) => {
       }
 
       doctorShaddaiVenta = doctorResultado.rows[0];
-
       idDoctorVenta = Number(doctorShaddaiVenta.id_perfil);
 
       if (!esValorActivo(doctorShaddaiVenta.activo)) {
@@ -3560,7 +3725,11 @@ export const listarVentasServiciosClinicos = async (req, res) => {
           OR vsd.nombre_paciente ILIKE $${params.length}
           OR vsd.nombre_servicio ILIKE $${params.length}
           OR COALESCE(scs.diagnostico, '') ILIKE $${params.length}
-          OR COALESCE(dsp.nombre_completo, '') ILIKE $${params.length}
+          OR COALESCE(
+            doctor_venta.nombre_completo,
+            doctor_solicitud.nombre_completo,
+            ''
+          ) ILIKE $${params.length}
         )
       `;
     }
@@ -3605,9 +3774,13 @@ export const listarVentasServiciosClinicos = async (req, res) => {
         scs.fecha_realizado,
         scs.diagnostico,
         scs.observaciones,
-        scs.id_doctor,
+        scs.id_doctor AS id_usuario_doctor_solicitud,
+        v.id_doctor AS id_perfil_doctor_venta,
 
-        dsp.nombre_completo AS doctor_shaddai
+        COALESCE(
+          doctor_venta.nombre_completo,
+          doctor_solicitud.nombre_completo
+        ) AS doctor_shaddai
       FROM venta_servicios_detalle vsd
       INNER JOIN ventas v
         ON v.id_venta = vsd.id_venta
@@ -3619,15 +3792,10 @@ export const listarVentasServiciosClinicos = async (req, res) => {
         ON c.id_caja = v.id_caja
       LEFT JOIN usuarios u
         ON u.id_usuario = v.id_usuario
-      LEFT JOIN LATERAL (
-        SELECT
-          d.nombre_completo
-        FROM doctores_shaddai_perfiles d
-        WHERE d.id_perfil = COALESCE(v.id_doctor, scs.id_doctor)
-           OR d.id_usuario = COALESCE(v.id_doctor, scs.id_doctor)
-        ORDER BY d.id_perfil ASC
-        LIMIT 1
-      ) dsp ON true
+      LEFT JOIN doctores_shaddai_perfiles doctor_venta
+        ON doctor_venta.id_perfil = v.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles doctor_solicitud
+        ON doctor_solicitud.id_usuario = scs.id_doctor
       ${where}
       ORDER BY v.fecha_venta DESC, vsd.id_venta_servicio DESC
     `;
@@ -3651,15 +3819,10 @@ export const listarVentasServiciosClinicos = async (req, res) => {
         ON c.id_caja = v.id_caja
       LEFT JOIN usuarios u
         ON u.id_usuario = v.id_usuario
-      LEFT JOIN LATERAL (
-        SELECT
-          d.nombre_completo
-        FROM doctores_shaddai_perfiles d
-        WHERE d.id_perfil = COALESCE(v.id_doctor, scs.id_doctor)
-           OR d.id_usuario = COALESCE(v.id_doctor, scs.id_doctor)
-        ORDER BY d.id_perfil ASC
-        LIMIT 1
-      ) dsp ON true
+      LEFT JOIN doctores_shaddai_perfiles doctor_venta
+        ON doctor_venta.id_perfil = v.id_doctor
+      LEFT JOIN doctores_shaddai_perfiles doctor_solicitud
+        ON doctor_solicitud.id_usuario = scs.id_doctor
       ${where}
     `;
 
