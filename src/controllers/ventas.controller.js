@@ -2730,7 +2730,12 @@ export const obtenerInfoDevolucionVenta = async (req, res) => {
 
 export const listarVentas = async (req, res) => {
   try {
-    const { sucursal, sesion, fecha_inicio, fecha_fin } = req.query;
+    const {
+      sucursal,
+      sesion,
+      fecha_inicio,
+      fecha_fin,
+    } = req.query;
 
     let query = `
       SELECT
@@ -2764,69 +2769,95 @@ export const listarVentas = async (req, res) => {
         dsp.nombre_completo AS doctor_shaddai,
         v.fecha_venta,
         COALESCE(cpm.puntos, 0)::numeric(12,2) AS puntos_cajero,
-        COALESCE(dpm.puntos, 0)::numeric(12,2) AS puntos_doctor_shaddai
+        COALESCE(dpm.puntos, 0)::numeric(12,2)
+          AS puntos_doctor_shaddai
       FROM ventas v
-      INNER JOIN sucursales s ON s.id_sucursal = v.id_sucursal
-      INNER JOIN cajas c ON c.id_caja = v.id_caja
-      INNER JOIN usuarios u ON u.id_usuario = v.id_usuario
-      LEFT JOIN tarjetas_puntos tp ON tp.id_tarjeta = v.id_tarjeta_puntos
-      LEFT JOIN doctores_shaddai_perfiles dsp ON dsp.id_perfil = v.id_doctor
-      LEFT JOIN cajeros_puntos_movimientos cpm 
-        ON cpm.id_venta = v.id_venta 
+      INNER JOIN sucursales s
+        ON s.id_sucursal = v.id_sucursal
+      INNER JOIN cajas c
+        ON c.id_caja = v.id_caja
+      INNER JOIN usuarios u
+        ON u.id_usuario = v.id_usuario
+      LEFT JOIN tarjetas_puntos tp
+        ON tp.id_tarjeta = v.id_tarjeta_puntos
+      LEFT JOIN doctores_shaddai_perfiles dsp
+        ON dsp.id_perfil = v.id_doctor
+      LEFT JOIN cajeros_puntos_movimientos cpm
+        ON cpm.id_venta = v.id_venta
        AND cpm.id_usuario = v.id_usuario
        AND cpm.tipo_movimiento = 'VENTA'
       LEFT JOIN doctores_puntos_movimientos dpm
         ON dpm.id_venta = v.id_venta
        AND dpm.origen_doctor = 'SHADDAI'
-       AND dpm.tipo_movimiento = 'ACUMULACION_VENTA_SHADDAI'
+       AND dpm.tipo_movimiento =
+         'ACUMULACION_VENTA_SHADDAI'
       WHERE 1 = 1
     `;
 
     const params = [];
 
+    /*
+     * Los usuarios normales solamente pueden consultar las ventas
+     * correspondientes a la caja que tienen asignada.
+     */
     if (!esSuperAdmin(req.usuario)) {
-      const idUsuario = obtenerIdUsuarioAutenticado(req.usuario);
+      const idUsuario =
+        obtenerIdUsuarioAutenticado(req.usuario);
 
       if (!idUsuario) {
         return res.status(401).json({
           ok: false,
-          mensaje: 'No se pudo identificar al usuario de la sesión',
+          mensaje:
+            'No se pudo identificar al usuario de la sesión',
         });
       }
 
       params.push(idUsuario);
-      query += ` AND c.id_usuario_asignado = $${params.length} `;
+
+      query += `
+        AND c.id_usuario_asignado = $${params.length}
+      `;
     }
 
     if (sucursal) {
-      params.push(sucursal);
-      query += ` AND v.id_sucursal = $${params.length} `;
+      params.push(Number(sucursal));
+
+      query += `
+        AND v.id_sucursal = $${params.length}
+      `;
     }
 
     if (sesion) {
-      params.push(sesion);
-      query += ` AND v.id_sesion = $${params.length} `;
+      params.push(Number(sesion));
+
+      query += `
+        AND v.id_sesion = $${params.length}
+      `;
     }
 
     if (fecha_inicio) {
       params.push(fecha_inicio);
-      where += `
-    AND (
-      v.fecha_venta AT TIME ZONE 'America/Mexico_City'
-    )::date >= $${params.length}::date
-  `;
+
+      query += `
+        AND (
+          v.fecha_venta AT TIME ZONE 'America/Mexico_City'
+        )::date >= $${params.length}::date
+      `;
     }
 
     if (fecha_fin) {
       params.push(fecha_fin);
-      where += `
-    AND (
-      v.fecha_venta AT TIME ZONE 'America/Mexico_City'
-    )::date <= $${params.length}::date
-  `;
+
+      query += `
+        AND (
+          v.fecha_venta AT TIME ZONE 'America/Mexico_City'
+        )::date <= $${params.length}::date
+      `;
     }
 
-    query += ` ORDER BY v.fecha_venta DESC `;
+    query += `
+      ORDER BY v.fecha_venta DESC
+    `;
 
     const resultado = await pool.query(query, params);
 
@@ -2835,7 +2866,12 @@ export const listarVentas = async (req, res) => {
       ventas: resultado.rows,
     });
   } catch (error) {
-    console.error('Error al listar ventas:', error);
+    console.error('Error al listar ventas:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
 
     return res.status(500).json({
       ok: false,
