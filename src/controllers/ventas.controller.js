@@ -3885,3 +3885,296 @@ export const listarVentasServiciosClinicos = async (req, res) => {
     });
   }
 };
+
+/**
+ * Cancela una solicitud clínica antes de que sea cobrada.
+ *
+ * Reglas:
+ * - Solamente puede cancelarse cuando está en PENDIENTE_CAJERO.
+ * - La solicitud debe pertenecer a la sucursal enviada por el POS.
+ * - El usuario debe tener acceso a la caja indicada.
+ * - No debe existir todavía en venta_servicios_detalle.
+ * - No genera venta, devolución ni movimiento de caja.
+ */
+export const cancelarServicioClinicoPendiente = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const idSolicitud = Number(req.params.idSolicitud);
+    const idSucursal = Number(req.body?.id_sucursal);
+    const idCaja = Number(req.body?.id_caja);
+    const motivo = limpiarTexto(req.body?.motivo);
+    const idUsuario = obtenerIdUsuarioAutenticado(req.usuario);
+
+    if (!Number.isInteger(idSolicitud) || idSolicitud <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La solicitud del servicio clínico no es válida',
+      });
+    }
+
+    if (!Number.isInteger(idSucursal) || idSucursal <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La sucursal seleccionada no es válida',
+      });
+    }
+
+    if (!Number.isInteger(idCaja) || idCaja <= 0) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La caja seleccionada no es válida',
+      });
+    }
+
+    if (!motivo) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'El motivo de cancelación es obligatorio',
+      });
+    }
+
+    if (!idUsuario) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: 'No se pudo identificar al usuario de la sesión',
+      });
+    }
+
+    await client.query('BEGIN');
+
+    /*
+     * El bloqueo evita que una cancelación y un cobro se procesen al mismo
+     * tiempo sobre la misma solicitud.
+     */
+    const solicitudResultado = await client.query(
+      `
+      SELECT
+        id_solicitud_servicio,
+        id_sucursal,
+        folio_servicio,
+        nombre_paciente,
+        estatus,
+        activo,
+        observaciones,
+        fecha_pago,
+        fecha_realizado
+      FROM servicios_clinicos_solicitudes
+      WHERE id_solicitud_servicio = $1
+      FOR UPDATE
+      `,
+      [idSolicitud]
+    );
+
+    if (solicitudResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        ok: false,
+        mensaje: 'No se encontró la solicitud del servicio clínico',
+      });
+    }
+
+    const solicitud = solicitudResultado.rows[0];
+
+    if (!esValorActivo(solicitud.activo)) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        ok: false,
+        mensaje: 'La solicitud del servicio clínico está inactiva',
+      });
+    }
+
+    if (Number(solicitud.id_sucursal) !== idSucursal) {
+      await client.query('ROLLBACK');
+
+      return res.status(403).json({
+        ok: false,
+        mensaje:
+          'La solicitud no pertenece a la sucursal actualmente seleccionada',
+      });
+    }
+
+    /*
+     * Se reutiliza la misma validación de acceso a caja que usa crearVenta.
+     * SUPER_ADMIN puede operar cualquier caja activa; los demás usuarios
+     * solamente la caja activa que tengan asignada.
+     */
+    const accesoCaja = await validarAccesoCajaAsignada({
+      db: client,
+      usuario: req.usuario,
+      idCaja,
+      idSucursal: solicitud.id_sucursal,
+      bloquear: true,
+    });
+
+    if (!accesoCaja.ok) {
+      await client.query('ROLLBACK');
+      return responderAccesoCajaDenegado(res, accesoCaja);
+    }
+
+    const estatusActual = String(solicitud.estatus || '')
+      .trim()
+      .toUpperCase();
+
+    if (estatusActual === 'CANCELADO' || estatusActual === 'CANCELADA') {
+      await client.query('ROLLBACK');
+
+      return res.status(409).json({
+        ok: false,
+        mensaje: 'La solicitud ya se encuentra cancelada',
+      });
+    }
+
+    if (estatusActual !== 'PENDIENTE_CAJERO') {
+      await client.query('ROLLBACK');
+
+      return res.status(409).json({
+        ok: false,
+        mensaje:
+          estatusActual === 'PAGADO'
+            ? 'El servicio ya fue cobrado y no puede cancelarse desde pendientes'
+            : `El servicio tiene estatus ${estatusActual || 'DESCONOCIDO'} y ya no puede cancelarse desde caja`,
+      });
+    }
+
+    /*
+     * Protección adicional: aunque el estatus siguiera desactualizado,
+     * no se permite cancelar una solicitud que ya tenga vínculo con una venta.
+     */
+    const ventaServicioResultado = await client.query(
+      `
+      SELECT
+        vsd.id_venta_servicio,
+        vsd.id_venta,
+        v.folio AS folio_venta,
+        v.estado AS estado_venta
+      FROM venta_servicios_detalle vsd
+      INNER JOIN ventas v
+        ON v.id_venta = vsd.id_venta
+      WHERE vsd.id_solicitud_servicio = $1
+      ORDER BY vsd.id_venta_servicio DESC
+      LIMIT 1
+      `,
+      [idSolicitud]
+    );
+
+    if (ventaServicioResultado.rows.length > 0) {
+      await client.query('ROLLBACK');
+
+      const ventaRelacionada = ventaServicioResultado.rows[0];
+
+      return res.status(409).json({
+        ok: false,
+        mensaje:
+          'El servicio ya está vinculado a una venta y no puede cancelarse como pendiente',
+        venta: {
+          id_venta: ventaRelacionada.id_venta,
+          folio: ventaRelacionada.folio_venta,
+          estado: ventaRelacionada.estado_venta,
+        },
+      });
+    }
+
+    const solicitudActualizadaResultado = await client.query(
+      `
+      UPDATE servicios_clinicos_solicitudes
+      SET
+        estatus = 'CANCELADO',
+        observaciones = CONCAT_WS(
+          E'\n',
+          NULLIF(BTRIM(COALESCE(observaciones, '')), ''),
+          FORMAT(
+            '[CANCELADO EN CAJA %s] Motivo: %s | Usuario: %s',
+            TO_CHAR(
+              CURRENT_TIMESTAMP AT TIME ZONE 'America/Mexico_City',
+              'DD/MM/YYYY HH24:MI'
+            ),
+            $2::text,
+            $3::text
+          )
+        ),
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE id_solicitud_servicio = $1
+        AND estatus = 'PENDIENTE_CAJERO'
+      RETURNING
+        id_solicitud_servicio,
+        id_sucursal,
+        folio_servicio,
+        nombre_paciente,
+        estatus,
+        observaciones,
+        fecha_actualizacion
+      `,
+      [idSolicitud, motivo, idUsuario]
+    );
+
+    if (solicitudActualizadaResultado.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(409).json({
+        ok: false,
+        mensaje:
+          'La solicitud cambió de estatus mientras se procesaba la cancelación',
+      });
+    }
+
+    /*
+     * Mantiene sincronizado el documento clínico generado para la solicitud.
+     * No se borra el documento; solamente se conserva como cancelado.
+     */
+    await client.query(
+      `
+      UPDATE documentos_clinicos
+      SET
+        estatus = 'CANCELADO',
+        fecha_actualizacion = CURRENT_TIMESTAMP
+      WHERE tabla_origen = 'servicios_clinicos_solicitudes'
+        AND id_origen = $1
+        AND COALESCE(UPPER(estatus), '') NOT IN (
+          'PAGADO',
+          'REALIZADO',
+          'CANCELADO',
+          'CANCELADA'
+        )
+      `,
+      [idSolicitud]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      mensaje:
+        'El servicio clínico fue cancelado y retirado de los pendientes de caja',
+      solicitud: solicitudActualizadaResultado.rows[0],
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {
+      // La transacción puede no haber iniciado.
+    }
+
+    console.error(
+      'Error al cancelar servicio clínico pendiente:',
+      {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        stack: error.stack,
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      mensaje:
+        error.message ||
+        'Error interno al cancelar el servicio clínico pendiente',
+    });
+  } finally {
+    client.release();
+  }
+};
+

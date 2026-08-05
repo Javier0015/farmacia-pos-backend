@@ -7,22 +7,53 @@ import {
   obtenerInfoDevolucionVenta,
   devolverVenta,
   listarVentasServiciosClinicos,
+  cancelarServicioClinicoPendiente,
 } from '../controllers/ventas.controller.js';
 
 import { verificarToken } from '../middlewares/auth.middleware.js';
 
 const router = Router();
 
-router.get('/', verificarToken, listarVentas);
+/*
+ * Rutas fijas primero.
+ */
+router.get(
+  '/servicios-clinicos',
+  verificarToken,
+  listarVentasServiciosClinicos
+);
 
-// RUTAS FIJAS PRIMERO
-router.get('/servicios-clinicos', verificarToken, listarVentasServiciosClinicos);
+router.patch(
+  '/servicios-clinicos/:idSolicitud/cancelar-pendiente',
+  verificarToken,
+  cancelarServicioClinicoPendiente
+);
 
-// RUTAS DINÁMICAS DESPUÉS
-router.get('/:id', verificarToken, obtenerVenta);
-router.get('/:id/devolucion-info', verificarToken, obtenerInfoDevolucionVenta);
-router.post('/:id/devolver', verificarToken, devolverVenta);
-
+/*
+ * Venta nueva.
+ */
 router.post('/', verificarToken, crearVenta);
+
+/*
+ * Rutas dinámicas después de las rutas fijas.
+ */
+router.get(
+  '/:id/devolucion-info',
+  verificarToken,
+  obtenerInfoDevolucionVenta
+);
+
+router.post(
+  '/:id/devolver',
+  verificarToken,
+  devolverVenta
+);
+
+router.get('/:id', verificarToken, obtenerVenta);
+
+/*
+ * Listado general.
+ */
+router.get('/', verificarToken, listarVentas);
 
 export default router;
