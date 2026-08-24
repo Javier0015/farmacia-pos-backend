@@ -22,6 +22,14 @@ const normalizarLote = (lote) => {
   return lote.trim().toUpperCase();
 };
 
+const redondearMoneda = (valor) => {
+  return Math.round((Number(valor || 0) + Number.EPSILON) * 100) / 100;
+};
+
+const aCentavos = (valor) => {
+  return Math.round((Number(valor || 0) + Number.EPSILON) * 100);
+};
+
 export const crearCompra = async (req, res) => {
   const client = await pool.connect();
 
@@ -201,9 +209,11 @@ export const crearCompra = async (req, res) => {
       }
 
       const cantidadNum = Number(cantidad);
-      const precioCompraNum = Number(precio_compra);
-      const descuentoProductoNum = Number(descuentoProducto || 0);
-      const subtotalProducto = cantidadNum * precioCompraNum - descuentoProductoNum;
+      const precioCompraNum = redondearMoneda(precio_compra);
+      const descuentoProductoNum = redondearMoneda(descuentoProducto || 0);
+      const subtotalProducto = redondearMoneda(
+        cantidadNum * precioCompraNum - descuentoProductoNum
+      );
 
       if (subtotalProducto < 0) {
         await client.query('ROLLBACK');
@@ -214,7 +224,7 @@ export const crearCompra = async (req, res) => {
         });
       }
 
-      subtotalCompra += subtotalProducto;
+      subtotalCompra = redondearMoneda(subtotalCompra + subtotalProducto);
 
       productosProcesados.push({
         id_producto,
@@ -230,14 +240,15 @@ export const crearCompra = async (req, res) => {
       });
     }
 
-    const impuestoNum = Number(impuesto || 0);
-    const descuentoNum = Number(descuento || 0);
-    const totalManualNum = Number(total_manual || 0);
+    const impuestoNum = redondearMoneda(impuesto || 0);
+    const descuentoNum = redondearMoneda(descuento || 0);
+    const totalManualNum = redondearMoneda(total_manual || 0);
 
-    const totalCompra =
+    const totalCompra = redondearMoneda(
       productosProcesados.length === 0
         ? totalManualNum - descuentoNum + impuestoNum
-        : subtotalCompra - descuentoNum + impuestoNum;
+        : subtotalCompra - descuentoNum + impuestoNum
+    );
 
     if (totalCompra < 0) {
       await client.query('ROLLBACK');
@@ -248,7 +259,7 @@ export const crearCompra = async (req, res) => {
       });
     }
 
-    const montoPagadoNum = Number(monto_pagado || 0);
+    const montoPagadoNum = redondearMoneda(monto_pagado || 0);
 
     if (montoPagadoNum < 0) {
       await client.query('ROLLBACK');
@@ -259,7 +270,10 @@ export const crearCompra = async (req, res) => {
       });
     }
 
-    if (montoPagadoNum > totalCompra) {
+    const totalCentavos = aCentavos(totalCompra);
+    const pagadoCentavos = aCentavos(montoPagadoNum);
+
+    if (pagadoCentavos > totalCentavos) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
@@ -268,15 +282,16 @@ export const crearCompra = async (req, res) => {
       });
     }
 
-    const saldo = totalCompra - montoPagadoNum;
+    const saldoCentavos = Math.max(totalCentavos - pagadoCentavos, 0);
+    const saldo = saldoCentavos / 100;
 
     let estado = 'PENDIENTE';
 
-    if (montoPagadoNum > 0 && saldo > 0) {
+    if (pagadoCentavos > 0 && saldoCentavos > 0) {
       estado = 'PARCIAL';
     }
 
-    if (montoPagadoNum > 0 && saldo === 0) {
+    if (pagadoCentavos > 0 && saldoCentavos === 0) {
       estado = 'PAGADA';
     }
 
@@ -1181,9 +1196,11 @@ export const actualizarCompra = async (req, res) => {
       }
 
       const cantidadNum = Number(cantidad);
-      const precioCompraNum = Number(precio_compra);
-      const descuentoProductoNum = Number(descuentoProducto || 0);
-      const subtotalProducto = cantidadNum * precioCompraNum - descuentoProductoNum;
+      const precioCompraNum = redondearMoneda(precio_compra);
+      const descuentoProductoNum = redondearMoneda(descuentoProducto || 0);
+      const subtotalProducto = redondearMoneda(
+        cantidadNum * precioCompraNum - descuentoProductoNum
+      );
 
       if (subtotalProducto < 0) {
         await client.query('ROLLBACK');
@@ -1194,7 +1211,7 @@ export const actualizarCompra = async (req, res) => {
         });
       }
 
-      subtotalCompra += subtotalProducto;
+      subtotalCompra = redondearMoneda(subtotalCompra + subtotalProducto);
 
       productosProcesados.push({
         id_producto,
@@ -1210,14 +1227,15 @@ export const actualizarCompra = async (req, res) => {
       });
     }
 
-    const impuestoNum = Number(impuesto || 0);
-    const descuentoNum = Number(descuento || 0);
-    const totalManualNum = Number(total_manual || 0);
+    const impuestoNum = redondearMoneda(impuesto || 0);
+    const descuentoNum = redondearMoneda(descuento || 0);
+    const totalManualNum = redondearMoneda(total_manual || 0);
 
-    const totalCompra =
+    const totalCompra = redondearMoneda(
       productosProcesados.length === 0
         ? totalManualNum - descuentoNum + impuestoNum
-        : subtotalCompra - descuentoNum + impuestoNum;
+        : subtotalCompra - descuentoNum + impuestoNum
+    );
 
     if (totalCompra < 0) {
       await client.query('ROLLBACK');
@@ -1228,7 +1246,7 @@ export const actualizarCompra = async (req, res) => {
       });
     }
 
-    const montoPagadoNum = Number(monto_pagado || 0);
+    const montoPagadoNum = redondearMoneda(monto_pagado || 0);
 
     if (montoPagadoNum < 0) {
       await client.query('ROLLBACK');
@@ -1239,7 +1257,10 @@ export const actualizarCompra = async (req, res) => {
       });
     }
 
-    if (montoPagadoNum > totalCompra) {
+    const totalCentavos = aCentavos(totalCompra);
+    const pagadoCentavos = aCentavos(montoPagadoNum);
+
+    if (pagadoCentavos > totalCentavos) {
       await client.query('ROLLBACK');
 
       return res.status(400).json({
@@ -1248,15 +1269,16 @@ export const actualizarCompra = async (req, res) => {
       });
     }
 
-    const saldo = totalCompra - montoPagadoNum;
+    const saldoCentavos = Math.max(totalCentavos - pagadoCentavos, 0);
+    const saldo = saldoCentavos / 100;
 
     let estado = 'PENDIENTE';
 
-    if (montoPagadoNum > 0 && saldo > 0) {
+    if (pagadoCentavos > 0 && saldoCentavos > 0) {
       estado = 'PARCIAL';
     }
 
-    if (montoPagadoNum > 0 && saldo === 0) {
+    if (pagadoCentavos > 0 && saldoCentavos === 0) {
       estado = 'PAGADA';
     }
 
@@ -1539,10 +1561,14 @@ export const actualizarCompra = async (req, res) => {
         [compraActualizada.id_compra]
       );
 
-      const totalPagadoPrevio = Number(pagosPrevios.rows[0]?.total_pagado || 0);
-      const montoNuevoPago = montoPagadoNum - totalPagadoPrevio;
+      const totalPagadoPrevio = redondearMoneda(
+        pagosPrevios.rows[0]?.total_pagado || 0
+      );
+      const montoNuevoPago = redondearMoneda(
+        montoPagadoNum - totalPagadoPrevio
+      );
 
-      if (montoNuevoPago > 0) {
+      if (aCentavos(montoNuevoPago) > 0) {
         await client.query(
           `
           INSERT INTO pagos_proveedor (
