@@ -352,9 +352,10 @@ export const crearCompra = async (req, res) => {
     subtotal,
     lote,
     fecha_caducidad,
-    observaciones
+    observaciones,
+    activo
   )
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
   RETURNING *
   `,
         [
@@ -784,6 +785,7 @@ export const obtenerCompra = async (req, res) => {
     )
     AND inv.id_producto = cd.id_producto
   WHERE cd.id_compra = $1
+    AND cd.activo = true
   ORDER BY cd.id_detalle ASC
   `,
       [id]
@@ -996,6 +998,7 @@ export const actualizarCompra = async (req, res) => {
         fecha_caducidad
       FROM compra_detalle
       WHERE id_compra = $1
+        AND activo = true
       `,
       [id]
     );
@@ -1126,8 +1129,10 @@ export const actualizarCompra = async (req, res) => {
 
     await client.query(
       `
-      DELETE FROM compra_detalle
+      UPDATE compra_detalle
+      SET activo = false
       WHERE id_compra = $1
+        AND activo = true
       `,
       [id]
     );
@@ -1351,9 +1356,10 @@ export const actualizarCompra = async (req, res) => {
           subtotal,
           lote,
           fecha_caducidad,
-          observaciones
+          observaciones,
+          activo
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
         RETURNING *
         `,
         [
@@ -1715,6 +1721,7 @@ export const cancelarCompra = async (req, res) => {
         fecha_caducidad
       FROM compra_detalle
       WHERE id_compra = $1
+        AND activo = true
       `,
       [id]
     );
